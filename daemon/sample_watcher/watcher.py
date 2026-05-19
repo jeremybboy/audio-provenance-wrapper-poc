@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import time
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif", ".mp3", ".m4a"}
+DEFAULT_EVIDENCE_PATH = Path("evidence/sample_import_events.jsonl")
+DEFAULT_WATCH_DIR = Path("~/Music/ProvenanceSamples")
+DEFAULT_NOTES = [
+    "Detected by filesystem watcher.",
+    "No claim is made that this file was placed on a specific Ableton track.",
+]
+
+
+@dataclass(frozen=True)
+class FileSignature:
+    size_bytes: int
+    modified_ns: int
+
+
+def utc_timestamp(timestamp: float | None = None) -> str:
+    if timestamp is None:
+        timestamp = time.time()
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def is_audio_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+
+
+def iter_audio_files(watch_dir: Path, recursive: bool) -> Iterable[Path]:
+    pattern = "**/*" if recursive else "*"
+    for path in sorted(watch_dir.glob(pattern)):
+        if is_audio_file(path):
+            yield path
+
+
+def file_signature(path: Path) -> FileSignature:
+    stat_result = path.stat()
+    return FileSignature(size_bytes=stat_result.st_size, modified_ns=stat_result.st_mtime_ns)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as audio_file:
+        for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def empty_audio_metadata() -> dict[str, float | int | None]:
+    return {
+        "duration_seconds": None,
+        "sample_rate": None,
+        "channels": None,
+    }
+
+
+def extract_audio_metadata(path: Path) -> dict[str, float | int | None]:
+    suffix = path.suffix.lower()
+    if suffix == ".wav":
+        return _extract_wave_metadata(path)
+    if suffix in {".aif", ".aiff"}:
+        return _extract_aiff_metadata(path)
+    return _extract_afinfo_metadata(path)
+
+
+def _extract_wave_metadata(path: Path) -> dict[str, float | int | None]:
+    import wave
+
+    metadata = empty_audio_metadata()
+    try:
+        with wave.open(str(path), "rb") as audio_file:
+            sample_rate = audio_file.getframerate()
+            frames = audio_file.getnframes()
+            metadata["sample_rate"] = sample_rate or None
+            metadata["channels"] = audio_file.getnchannels()
+            metadata["duration_seconds"] = frames / sample_rate if sample_rate else None
+    except (EOFError, OSError, wave.Error):
+        return _extract_afinfo_metadata(path)
+    return metadata
+
+
+def _extract_aiff_metadata(path: Path) -> dict[str, float | int | None]:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            import aifc
+    except ModuleNotFoundError:
+        return _extract_afinfo_metadata(path)
+
+    metadata = empty_audio_metadata()
+    try:
+        with aifc.open(str(path), "rb") as audio_file:
+            sample_rate = audio_file.getframerate()
+            frames = audio_file.getnframes()
+            metadata["sample_rate"] = sample_rate or None
+            metadata["channels"] = audio_file.getnchannels()
+            metadata["duration_seconds"] = frames / sample_rate if sample_rate else None
+    except (EOFError, OSError, aifc.Error):
+        return _extract_afinfo_metadata(path)
+    return metadata
+
+
+def _extract_afinfo_metadata(path: Path) -> dict[str, float | int | None]:
+    metadata = empty_audio_metadata()
+    try:
+        result = subprocess.run(
+            ["afinfo", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return metadata
+
+    if result.returncode != 0:
+        return metadata
+
+    duration_match = re.search(r"estimated duration:\s*([0-9.]+)\s*sec", result.stdout)
+    channels_match = re.search(r"Data format:\s*(\d+)\s+ch", result.stdout)
+    sample_rate_match = re.search(r"Data format:\s*\d+\s+ch,\s*([0-9.]+)\s+Hz", result.stdout)
+
+    if duration_match:
+        metadata["duration_seconds"] = float(duration_match.group(1))
+    if sample_rate_match:
+        sample_rate = float(sample_rate_match.group(1))
+        metadata["sample_rate"] = int(sample_rate) if sample_rate.is_integer() else sample_rate
+    if channels_match:
+        metadata["channels"] = int(channels_match.group(1))
+
+    return metadata
+
+
+def build_sample_file_event(path: Path, observed_at: str | None = None) -> dict[str, object]:
+    resolved_path = path.expanduser().resolve()
+    stat_result = resolved_path.stat()
+    created_timestamp = getattr(stat_result, "st_birthtime", stat_result.st_ctime)
+
+    return {
+        "event_type": "sample_file_observed",
+        "proof_level": "directly_observed",
+        "file_name": resolved_path.name,
+        "file_path": str(resolved_path),
+        "sha256": sha256_file(resolved_path),
+        "format": resolved_path.suffix.lower().lstrip("."),
+        "file_extension": resolved_path.suffix.lower(),
+        "file_size_bytes": stat_result.st_size,
+        "created_at": utc_timestamp(created_timestamp),
+        "modified_at": utc_timestamp(stat_result.st_mtime),
+        "observed_at": observed_at or utc_timestamp(),
+        "audio_metadata": extract_audio_metadata(resolved_path),
+        "notes": list(DEFAULT_NOTES),
+    }
+
+
+def append_event(event: dict[str, object], evidence_path: Path) -> None:
+    resolved_path = evidence_path.expanduser()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_path.open("a", encoding="utf-8") as evidence_file:
+        json.dump(event, evidence_file, separators=(",", ":"))
+        evidence_file.write("\n")
+
+
+class SampleWatcher:
+    def __init__(
+        self,
+        watch_dir: Path,
+        evidence_path: Path,
+        poll_interval_seconds: float = 2.0,
+        stable_polls: int = 2,
+        recursive: bool = False,
+    ) -> None:
+        self.watch_dir = watch_dir.expanduser()
+        self.evidence_path = evidence_path.expanduser()
+        self.poll_interval_seconds = poll_interval_seconds
+        self.stable_polls = max(1, stable_polls)
+        self.recursive = recursive
+        self._seen: dict[str, FileSignature] = {}
+        self._pending: dict[str, tuple[FileSignature, int]] = {}
+
+    def mark_existing_seen(self) -> None:
+        self.watch_dir.mkdir(parents=True, exist_ok=True)
+        for path in iter_audio_files(self.watch_dir, self.recursive):
+            self._seen[str(path.resolve())] = file_signature(path)
+
+    def scan_once(self) -> list[dict[str, object]]:
+        self.watch_dir.mkdir(parents=True, exist_ok=True)
+        observed_events: list[dict[str, object]] = []
+
+        for path in iter_audio_files(self.watch_dir, self.recursive):
+            resolved_key = str(path.resolve())
+            try:
+                signature = file_signature(path)
+            except OSError:
+                continue
+
+            if self._seen.get(resolved_key) == signature:
+                continue
+
+            previous_signature, stable_count = self._pending.get(resolved_key, (signature, 0))
+            stable_count = stable_count + 1 if previous_signature == signature else 1
+            self._pending[resolved_key] = (signature, stable_count)
+
+            if stable_count < self.stable_polls:
+                continue
+
+            try:
+                event = build_sample_file_event(path)
+            except OSError:
+                continue
+
+            append_event(event, self.evidence_path)
+            observed_events.append(event)
+            self._seen[resolved_key] = signature
+            self._pending.pop(resolved_key, None)
+
+        return observed_events
+
+    def run_forever(self, scan_existing: bool = False) -> None:
+        if scan_existing:
+            self.scan_once()
+        else:
+            self.mark_existing_seen()
+
+        print(
+            f"Watching {self.watch_dir} for audio samples; writing {self.evidence_path}",
+            file=sys.stderr,
+        )
+        while True:
+            for event in self.scan_once():
+                print(json.dumps(event, separators=(",", ":")), flush=True)
+            time.sleep(self.poll_interval_seconds)
+
+
+def observe_existing_files(watch_dir: Path, evidence_path: Path, recursive: bool = False) -> list[dict[str, object]]:
+    watch_dir = watch_dir.expanduser()
+    evidence_path = evidence_path.expanduser()
+    watch_dir.mkdir(parents=True, exist_ok=True)
+    observed_events: list[dict[str, object]] = []
+
+    for path in iter_audio_files(watch_dir, recursive):
+        event = build_sample_file_event(path)
+        append_event(event, evidence_path)
+        observed_events.append(event)
+
+    return observed_events
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Watch a local sample folder and write provenance evidence JSONL.")
+    parser.add_argument(
+        "--watch-dir",
+        type=Path,
+        default=DEFAULT_WATCH_DIR,
+        help="Folder to watch for sample files. Defaults to ~/Music/ProvenanceSamples.",
+    )
+    parser.add_argument(
+        "--evidence-file",
+        type=Path,
+        default=DEFAULT_EVIDENCE_PATH,
+        help="JSONL output path. Defaults to evidence/sample_import_events.jsonl.",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between directory scans.",
+    )
+    parser.add_argument(
+        "--stable-polls",
+        type=int,
+        default=2,
+        help="Number of unchanged scans required before hashing a detected file.",
+    )
+    parser.add_argument(
+        "--scan-existing",
+        action="store_true",
+        help="Record audio files that already exist in the watch folder at startup.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Record current audio files once and exit.",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Scan subdirectories under the configured sample folder.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+
+    if args.once:
+        for event in observe_existing_files(args.watch_dir, args.evidence_file, args.recursive):
+            print(json.dumps(event, separators=(",", ":")))
+        return 0
+
+    watcher = SampleWatcher(
+        watch_dir=args.watch_dir,
+        evidence_path=args.evidence_file,
+        poll_interval_seconds=args.poll_interval,
+        stable_polls=args.stable_polls,
+        recursive=args.recursive,
+    )
+    try:
+        watcher.run_forever(scan_existing=args.scan_existing)
+    except KeyboardInterrupt:
+        return 0
+    return 0

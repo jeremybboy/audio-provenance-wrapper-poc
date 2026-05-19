@@ -65,8 +65,11 @@ Responsibilities:
 - receive UDP events
 - persist session state
 - monitor export folders
+- monitor configured sample import folders
 - detect exported WAV or AIFF files
+- detect imported sample files where the filesystem watcher can observe them
 - hash final exports
+- hash observed sample files
 - generate internal provenance records
 - serialize minimal C2PA-compatible manifests
 
@@ -80,6 +83,7 @@ It stores:
 - source categories
 - proof levels
 - export relationships
+- filesystem-observed sample import events
 - unknown or bypassed states
 
 This internal model is richer than the exported C2PA manifest.
@@ -104,6 +108,7 @@ The system can only verify what passes through the capture plugin.
 Observable examples:
 - audio buffers
 - exported files
+- sample files detected in configured watch folders
 - timestamps
 - routed MIDI events
 
@@ -112,6 +117,7 @@ Non-observable examples:
 - internal preset logic
 - bypassed routing
 - DAW internals
+- exact Ableton track placement for a filesystem-observed sample
 - unverifiable upstream provenance
 
 ## Source Categories
