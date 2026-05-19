@@ -1,6 +1,18 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <cmath>
+
+namespace
+{
+constexpr auto audioDetectionThreshold = 1.0e-5;
+
+std::uint64_t getMonotonicMilliseconds() noexcept
+{
+    return static_cast<std::uint64_t> (juce::Time::getMillisecondCounterHiRes());
+}
+}
+
 AudioProvenanceCaptureAudioProcessor::AudioProvenanceCaptureAudioProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -8,8 +20,14 @@ AudioProvenanceCaptureAudioProcessor::AudioProvenanceCaptureAudioProcessor()
 {
 }
 
-void AudioProvenanceCaptureAudioProcessor::prepareToPlay (double, int)
+void AudioProvenanceCaptureAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    observedSampleRateHz.store (static_cast<int> (std::lround (sampleRate)), std::memory_order_relaxed);
+    observedBufferSizeSamples.store (samplesPerBlock, std::memory_order_relaxed);
+    observedChannelCount.store (getTotalNumInputChannels(), std::memory_order_relaxed);
+    lastBufferHadAudio.store (false, std::memory_order_relaxed);
+    lastBufferSeenMilliseconds.store (0, std::memory_order_relaxed);
+    lastNonSilentBufferSeenMilliseconds.store (0, std::memory_order_relaxed);
 }
 
 void AudioProvenanceCaptureAudioProcessor::releaseResources()
@@ -35,6 +53,7 @@ void AudioProvenanceCaptureAudioProcessor::processBlock (juce::AudioBuffer<float
                                                          juce::MidiBuffer& midiMessages)
 {
     juce::ignoreUnused (midiMessages);
+    observeAudioBuffer (buffer);
     passThrough (buffer);
 }
 
@@ -42,6 +61,7 @@ void AudioProvenanceCaptureAudioProcessor::processBlock (juce::AudioBuffer<doubl
                                                          juce::MidiBuffer& midiMessages)
 {
     juce::ignoreUnused (midiMessages);
+    observeAudioBuffer (buffer);
     passThrough (buffer);
 }
 
@@ -53,6 +73,50 @@ void AudioProvenanceCaptureAudioProcessor::passThrough (juce::AudioBuffer<Sample
 
     for (auto channel = totalInputChannels; channel < totalOutputChannels; ++channel)
         buffer.clear (channel, 0, buffer.getNumSamples());
+}
+
+template <typename SampleType>
+void AudioProvenanceCaptureAudioProcessor::observeAudioBuffer (const juce::AudioBuffer<SampleType>& buffer) noexcept
+{
+    const auto inputChannels = juce::jmin (getTotalNumInputChannels(), buffer.getNumChannels());
+    const auto numSamples = buffer.getNumSamples();
+    auto hasAudio = false;
+
+    for (auto channel = 0; channel < inputChannels && ! hasAudio; ++channel)
+    {
+        const auto* samples = buffer.getReadPointer (channel);
+
+        for (auto sample = 0; sample < numSamples; ++sample)
+        {
+            if (std::abs (samples[sample]) > static_cast<SampleType> (audioDetectionThreshold))
+            {
+                hasAudio = true;
+                break;
+            }
+        }
+    }
+
+    const auto nowMilliseconds = getMonotonicMilliseconds();
+    observedChannelCount.store (inputChannels, std::memory_order_relaxed);
+    observedBufferSizeSamples.store (numSamples, std::memory_order_relaxed);
+    lastBufferSeenMilliseconds.store (nowMilliseconds, std::memory_order_relaxed);
+    lastBufferHadAudio.store (hasAudio, std::memory_order_relaxed);
+
+    if (hasAudio)
+        lastNonSilentBufferSeenMilliseconds.store (nowMilliseconds, std::memory_order_relaxed);
+}
+
+AudioProvenanceCaptureAudioProcessor::AudioBufferObservationSnapshot
+AudioProvenanceCaptureAudioProcessor::getAudioBufferObservationSnapshot() const noexcept
+{
+    AudioBufferObservationSnapshot snapshot;
+    snapshot.channelCount = observedChannelCount.load (std::memory_order_relaxed);
+    snapshot.sampleRateHz = observedSampleRateHz.load (std::memory_order_relaxed);
+    snapshot.bufferSizeSamples = observedBufferSizeSamples.load (std::memory_order_relaxed);
+    snapshot.lastBufferSeenMilliseconds = lastBufferSeenMilliseconds.load (std::memory_order_relaxed);
+    snapshot.lastNonSilentBufferSeenMilliseconds = lastNonSilentBufferSeenMilliseconds.load (std::memory_order_relaxed);
+    snapshot.lastBufferHadAudio = lastBufferHadAudio.load (std::memory_order_relaxed);
+    return snapshot;
 }
 
 juce::AudioProcessorEditor* AudioProvenanceCaptureAudioProcessor::createEditor()
