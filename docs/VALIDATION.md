@@ -1,0 +1,105 @@
+# Validation
+
+This page documents manual validation for Issue #4, Epic 1 - JUCE Plugin Scaffold.
+
+Scope is intentionally limited to a stable VST3 pass-through plugin. This milestone does not implement provenance capture, hashing, UDP, C2PA, daemon behavior, or wrapper-host plugin loading.
+
+## Milestone A - JUCE Project Builds Successfully
+
+### Manual Test
+
+From the repository root on macOS:
+
+```sh
+cmake -S . -B build -DAPW_JUCE_DIR=/Users/uzanj/Downloads/JUCE -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --target AudioProvenanceCapture_VST3 --config Debug
+```
+
+If JUCE is somewhere else, replace `/Users/uzanj/Downloads/JUCE` with that local checkout path.
+
+### Expected Result
+
+CMake configures cleanly and produces `Audio Provenance Capture.vst3` under the build artefacts directory.
+
+### Local Result
+
+Validated on 2026-05-19 with JUCE at `/Users/uzanj/Downloads/JUCE`. Configure and VST3 build completed successfully, and `codesign --verify --deep --strict` passed for the generated bundle.
+
+### Likely Failure Modes
+
+- JUCE is missing or `APW_JUCE_DIR` points at the wrong directory.
+- Xcode Command Line Tools are missing or not selected.
+- CMake is too old to support the project.
+- macOS blocks writes to the selected build directory.
+
+## Milestone B - Plugin Loads in Ableton Live
+
+Codex cannot complete this milestone from the shell. It requires manual validation in Ableton Live.
+
+### Manual Test
+
+1. Build Milestone A.
+2. Copy the built VST3 bundle into `~/Library/Audio/Plug-Ins/VST3/`.
+3. Open Ableton Live.
+4. Open `Live > Settings > Plug-Ins` or `Live > Preferences > Plug-Ins`, depending on Ableton version.
+5. Enable VST3 system folders and rescan plug-ins.
+6. Search for `Audio Provenance Capture`.
+7. Insert it on an audio track.
+
+### Expected Result
+
+Ableton lists the plugin and opens a small editor showing the v0.1 pass-through status.
+
+### Likely Failure Modes
+
+- The VST3 bundle was copied to the wrong folder.
+- Ableton has VST3 system folders disabled.
+- Ableton needs a full rescan or restart.
+- The plugin failed validation because the local build is stale or incomplete.
+
+## Milestone C - Audio Passes Through Unchanged
+
+Codex cannot complete this milestone from the shell. It requires manual validation in Ableton Live.
+
+### Manual Test
+
+1. Add a known audio clip to an Ableton audio track.
+2. Play the clip without the plugin and note the audible level and meter behavior.
+3. Insert `Audio Provenance Capture` on the same track.
+4. Toggle the plugin on and off during playback.
+5. For a stricter check, duplicate the track, put the plugin on only one copy, invert polarity on one track with Ableton Utility, and play both together.
+
+### Expected Result
+
+The normal listening test should sound unchanged. In the polarity-cancel test, matching audio should cancel to silence or near-silence.
+
+### Likely Failure Modes
+
+- Host routing differs between the two tracks.
+- A gain, pan, warp, or Utility setting differs between the reference and plugin paths.
+- The plugin is inserted on the wrong track.
+- Mono/stereo routing does not match.
+
+## Milestone D - Plugin Survives Playback Start/Stop and Project Reload
+
+Codex cannot complete this milestone from the shell. It requires manual validation in Ableton Live.
+
+### Manual Test
+
+1. Insert the plugin on an audio track.
+2. Start and stop playback repeatedly.
+3. Loop a section for several minutes.
+4. Save the Ableton set.
+5. Close and reopen Ableton.
+6. Reload the set and start playback again.
+
+### Expected Result
+
+Ableton reloads the set, the plugin remains inserted, the editor opens, and playback continues without crashes or audio interruption.
+
+### Likely Failure Modes
+
+- Ableton rescans and rejects an older copied bundle.
+- The plugin bundle was moved or deleted after saving the set.
+- A local debug build was replaced while Ableton was still open.
+- The test set uses unsupported routing outside mono or stereo audio tracks.
