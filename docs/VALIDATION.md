@@ -1,8 +1,43 @@
 # Validation
 
-This page documents manual validation for Issue #4, Epic 1 - JUCE Plugin Scaffold.
+This page documents manual validation for the JUCE VST3 proof-of-concept milestones.
 
-Scope is intentionally limited to a stable VST3 pass-through plugin. This milestone does not implement provenance capture, hashing, UDP, C2PA, daemon behavior, or wrapper-host plugin loading.
+Scope is intentionally limited to the current milestone under test. Epic 3 adds visible audio buffer observation in the plugin UI, but still does not implement hashing, UDP, C2PA, daemon behavior, file logging, or wrapper-host plugin loading.
+
+## Epic 3 - Audio Buffer Observation Validation
+
+This section documents manual validation for GitHub issue `#6`, Epic 3 - Audio Buffer Observation.
+
+The plugin observes lightweight buffer metadata and non-silent audio presence in the audio callback, stores that state in atomics, and lets the UI refresh labels on a timer. It does not hash audio, send UDP, write files, run a daemon, create C2PA data, or host wrapped plugins.
+
+### Manual Ableton Test
+
+1. Build the plugin using the Milestone A build steps below.
+2. Copy `Audio Provenance Capture.vst3` to `~/Library/Audio/Plug-Ins/VST3/`.
+3. Open Ableton Live and rescan VST3 plugins if needed.
+4. Load a sample loop on an audio track.
+5. Insert `Audio Provenance Capture` on the audio track.
+6. Open the plugin UI.
+7. Press play.
+8. Confirm the UI changes from `Capture status: IDLE` to `Capture status: ACTIVE`.
+9. Confirm `Audio detected: yes` while non-silent audio is playing.
+10. Confirm the UI displays channel count, sample rate, buffer size, and `Last buffer seen: HH:MM:SS`.
+11. Stop playback.
+12. Confirm the UI eventually returns to `Capture status: IDLE` and `Audio detected: no`, or otherwise reflects no recent non-silent audio if Ableton continues delivering silent buffers.
+
+### Expected Results
+
+- The plugin still loads as `Audio Provenance Capture`.
+- Audio remains audible and passes through unchanged.
+- The UI visibly reports recent non-silent buffer activity during playback.
+- `Channels`, `Sample rate`, `Buffer size`, and `Last buffer seen` update from observed host buffers.
+- No hashing, UDP, daemon, C2PA, file logging, or wrapper-host behavior is introduced.
+
+### Known Limitations
+
+- This is a UI-visible observation milestone, not provenance capture or manifest generation.
+- `Capture status: ACTIVE` means recent non-silent audio was observed through the plugin, not that full Ableton provenance is captured.
+- Host-specific behavior after transport stop can vary; some hosts may continue calling the plugin with silent buffers.
 
 ## Milestone A - JUCE Project Builds Successfully
 
