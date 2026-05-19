@@ -4,6 +4,68 @@ This page documents manual validation for Issue #4, Epic 1 - JUCE Plugin Scaffol
 
 Scope is intentionally limited to a stable VST3 pass-through plugin. This milestone does not implement provenance capture, hashing, UDP, C2PA, daemon behavior, or wrapper-host plugin loading.
 
+## Epic 2 - Audio Pass-Through Validation
+
+This section records manual Ableton Live validation for GitHub issue `#5`, Epic 2 - Audio Pass-Through.
+
+The current plugin is only a transparent pass-through interception point. It does not capture provenance, hash audio, send UDP events, host wrapped plugins, inspect downstream devices, or generate manifests.
+
+### Manual Ableton Validation Reference
+
+Manual validation was reported on 2026-05-19 using an Ableton Live device chain:
+
+```text
+Audio Provenance Capture -> Channel EQ -> Limiter
+```
+
+The validation screenshot shows the `Audio Provenance Capture` VST3 inserted before Ableton `Channel EQ` and `Limiter`, the plugin editor open, stereo audio clips playing, and active level meters after the plugin chain.
+
+### Validation Workflow
+
+1. Build the VST3 plugin using the Milestone A build steps below.
+2. Copy `Audio Provenance Capture.vst3` into `~/Library/Audio/Plug-Ins/VST3/`.
+3. Open Ableton Live and rescan VST3 plugins.
+4. Add an audio clip to an audio track.
+5. Insert `Audio Provenance Capture` as the first device on the track.
+6. Insert `Channel EQ` after the plugin.
+7. Insert `Limiter` after `Channel EQ`.
+8. Start playback.
+9. Open the plugin UI.
+10. Confirm audio meters remain active through the downstream Ableton devices.
+11. Confirm stereo playback remains audible and stable.
+12. Stop and restart playback to check basic transport stability.
+
+### Validation Checklist
+
+- [x] Plugin loads successfully in Ableton Live.
+- [x] Plugin UI opens correctly.
+- [x] Audio passes through the plugin.
+- [x] Downstream `Channel EQ` receives signal after the plugin.
+- [x] Downstream `Limiter` receives signal after `Channel EQ`.
+- [x] Stereo playback works.
+- [x] Audio meters show active signal flow.
+- [x] No crash was observed during playback.
+- [x] No provenance, hashing, UDP, C2PA, or wrapper-host behavior is claimed by this validation.
+
+### Expected Results
+
+- Ableton lists and loads `Audio Provenance Capture` as a VST3 plugin.
+- The plugin editor opens and displays the v0.1 pass-through status.
+- Audio remains audible when the plugin is active.
+- Downstream Ableton devices continue receiving signal.
+- Playback does not crash during the tested session.
+
+### Known Limitations
+
+- This validation is manual Ableton validation, not automated audio null testing.
+- The screenshot supports the observed device-chain setup and active signal flow, but it does not prove bit-perfect sample identity by itself.
+- No provenance events are produced yet.
+- No audio hashes or fingerprints are produced yet.
+- No UDP communication or daemon integration exists yet.
+- No C2PA manifest or JSON provenance output exists yet.
+- No wrapper-host plugin loading exists yet.
+- Hidden Ableton state, hidden plugin state, preset identity, sample license, and upstream source provenance remain unknown and unobserved.
+
 ## Milestone A - JUCE Project Builds Successfully
 
 ### Manual Test
