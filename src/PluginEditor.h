@@ -2,9 +2,12 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include <cstdint>
+
 class AudioProvenanceCaptureAudioProcessor;
 
-class AudioProvenanceCaptureAudioProcessorEditor final : public juce::AudioProcessorEditor
+class AudioProvenanceCaptureAudioProcessorEditor final : public juce::AudioProcessorEditor,
+                                                        private juce::Timer
 {
 public:
     explicit AudioProvenanceCaptureAudioProcessorEditor (AudioProvenanceCaptureAudioProcessor&);
@@ -14,10 +17,20 @@ public:
     void resized() override;
 
 private:
+    void timerCallback() override;
+    void updateObservationLabels();
+
     AudioProvenanceCaptureAudioProcessor& audioProcessor;
     juce::Label titleLabel;
-    juce::Label statusLabel;
+    juce::Label captureStatusLabel;
+    juce::Label audioDetectedLabel;
+    juce::Label channelCountLabel;
+    juce::Label sampleRateLabel;
+    juce::Label bufferSizeLabel;
+    juce::Label lastBufferSeenLabel;
     juce::Label scopeLabel;
+    std::uint64_t lastRenderedBufferSeenMilliseconds = 0;
+    juce::String lastRenderedBufferSeenText = "never";
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioProvenanceCaptureAudioProcessorEditor)
 };
