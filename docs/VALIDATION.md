@@ -4,6 +4,12 @@ This page documents manual validation for the JUCE VST3 proof-of-concept milesto
 
 Scope is intentionally limited to the current milestone under test. Epic 3 adds visible audio buffer observation in the plugin UI, but still does not implement hashing, UDP, C2PA, daemon behavior, file logging, or wrapper-host plugin loading.
 
+## Ableton Semantic Bridge Research Spike
+
+Manual validation for the Max for Live / Live API probe is documented in `docs/ABLETON_BRIDGE_VALIDATION.md`.
+
+This research spike probes Live session metadata exposed by the Live API. It does not modify the plugin, add C2PA signing, add wrapper-host behavior, or claim full Ableton provenance.
+
 ## Epic 3 - Audio Buffer Observation Validation
 
 This section documents manual validation for GitHub issue `#6`, Epic 3 - Audio Buffer Observation.

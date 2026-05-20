@@ -70,6 +70,17 @@ Responsibilities:
 - generate internal provenance records
 - serialize minimal C2PA-compatible manifests
 
+## Ableton Semantic Bridge Research
+
+A Max for Live / Live API bridge may be used as a research-only session metadata probe.
+
+Responsibilities:
+- inspect tracks, clips, selected track, devices, and exposed parameters where Live API allows it
+- test whether audio clip file paths are exposed
+- report limitations and proof levels
+
+This bridge does not replace the capture plugin trust boundary and must not claim full DAW provenance.
+
 ## Internal Provenance Record
 
 The internal provenance record is the primary truth model.
