@@ -709,12 +709,41 @@ support VST3 (or AU/CLAP/AAX with corresponding plugin builds).
 - State machine per stem
 - End-to-end integration tests
 
-### Phase 6: ARA integration (DAWs that support it)
+### Phase 6: Hardware attestation
+
+- Secure Enclave provider (macOS) via Security.framework
+- TPM 2.0 provider (Linux) via tpm2-tools
+- Software fallback for development
+- Hash chain root binding to hardware keys
+- Self-entangled cosignatures per checkpoint
+
+### Phase 7: External time anchoring
+
+- RFC 3161 TSA client (DigiCert, Sectigo, DFN)
+- Roughtime client (Cloudflare, Google, int08h)
+- Dual-anchor verification with configurable tolerance
+- Periodic checkpoint anchoring (every N windows or M seconds)
+
+### Phase 8: ARA integration (DAWs that support it)
 
 - ARA host adapter in the capture plugin
 - Direct edit operation events (no inference needed)
 - Proof level `directly_observed` for ARA-sourced edits
 - Fallback to inference layers for non-ARA DAWs
+
+### Phase 9: Anti-forgery analysis
+
+- Audio stream regularity detection (RMS, spectral, transition timing)
+- Input behavior analysis (IKI distribution, pauses, fatigue, skewness)
+- Hash chain integrity verification (continuity, duplicates, monotonicity)
+- Suspicion scoring model following CPoE severity weighting
+
+### Phase 10: C2PA manifest generation
+
+- Manifest builder from composite evidence
+- C2PA assertion mapping (c2pa.hash.data, c2pa.ingredient, c2pa.actions)
+- Custom apw: namespace for proof levels and unobserved data
+- JSON manifest export with explicit unknown/unobserved fields
 
 ---
 
@@ -774,6 +803,43 @@ support VST3 (or AU/CLAP/AAX with corresponding plugin builds).
 | `composite_edit` | `edit_type`, `confidence`, `contributing_events` |
 | `layer_unavailable` | `layer`, `reason`, `impact` |
 
+### Hardware Attestation
+
+| Event | Required fields |
+|-------|----------------|
+| `hardware_binding` | `chain_root_hash`, `device_id`, `signature_hex` |
+| `hardware_cosignature` | `entangled_hash`, `content_hash`, `monotonic_counter` |
+
+### Time Anchoring
+
+| Event | Required fields |
+|-------|----------------|
+| `time_anchor` | `source`, `timestamp_ms`, `nonce_hex`, `response_hex` |
+| `dual_anchor` | `tsa_proof`, `roughtime_proof`, `within_tolerance` |
+
+### Forgery Analysis (inferred)
+
+| Event | Required fields |
+|-------|----------------|
+| `forgery_analysis` | `suspicion_score`, `flags`, `sample_count` |
+
+### ARA Integration (directly_observed)
+
+| Event | Required fields |
+|-------|----------------|
+| `ara_region_added` | `region_id`, `timeline_position`, `duration` |
+| `ara_region_removed` | `region_id` |
+| `ara_region_modified` | `region_id`, `property`, `old_value`, `new_value` |
+| `ara_modification_created` | `modification_id`, `source_id`, `type` |
+| `ara_modification_changed` | `modification_id`, `property`, `delta` |
+| `ara_source_added` | `source_id`, `file_ref`, `sample_rate_hz` |
+
+### Manifest Generation
+
+| Output | Format |
+|--------|--------|
+| `manifest.json` | C2PA-compatible crJSON with apw: extensions |
+
 ---
 
 ## Appendix B: Comparison with CPoE Approach
@@ -783,12 +849,13 @@ support VST3 (or AU/CLAP/AAX with corresponding plugin builds).
 | Primary input | Keystrokes (CGEventTap) | Audio buffers (VST3) |
 | Content hashing | Document checkpoint chain | Audio window hash chain |
 | Behavioral signal | IKI distribution, dwell/flight time | Spectral centroid, RMS, ZCR |
-| Temporal proof | VDF (Verifiable Delay Function) | Hash chain ordering |
-| Hardware binding | TPM/Secure Enclave cosignature | Not yet (future) |
+| Temporal proof | VDF (Verifiable Delay Function) | Dual-anchor (RFC 3161 + Roughtime) |
+| Hardware binding | TPM/Secure Enclave cosignature | Secure Enclave / TPM self-entangled cosignatures |
 | Edit granularity | Per-keystroke | Per-window (~93ms at 44.1kHz) |
 | Structural observation | N/A (text is linear) | Project file diff, screen features |
-| Forgery detection | IKI anomaly analysis | Behavioral fingerprint (future) |
-| Cross-signal correlation | Jitter binding (entropy entanglement) | Temporal alignment + confidence |
+| Forgery detection | IKI anomaly analysis | Audio stream + input behavior + hash chain integrity |
+| Cross-signal correlation | Jitter binding (entropy entanglement) | Temporal alignment + confidence scoring |
+| Manifest output | Evidence packet (CBOR/COSE) | C2PA-compatible crJSON manifest |
 
 The core architectural insight from CPoE that applies here: **no single signal
 proves anything; the combination of independent signals, temporally correlated
