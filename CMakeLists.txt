@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(AudioProvenanceWrapperPoc
-    VERSION 0.1.0
+    VERSION 0.2.0
     LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -28,7 +28,7 @@ juce_add_plugin(AudioProvenanceCapture
     COMPANY_NAME "Audio Provenance POC"
     BUNDLE_ID "com.audioprovenance.capture"
     IS_SYNTH FALSE
-    NEEDS_MIDI_INPUT FALSE
+    NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
@@ -40,6 +40,8 @@ juce_add_plugin(AudioProvenanceCapture
 
 target_sources(AudioProvenanceCapture
     PRIVATE
+        src/AudioObserver.cpp
+        src/EventEmitter.cpp
         src/PluginEditor.cpp
         src/PluginProcessor.cpp)
 
@@ -56,6 +58,8 @@ target_compile_definitions(AudioProvenanceCapture
 target_link_libraries(AudioProvenanceCapture
     PRIVATE
         juce::juce_audio_processors
+        juce::juce_cryptography
+        juce::juce_dsp
         juce::juce_gui_basics
     PUBLIC
         juce::juce_recommended_config_flags

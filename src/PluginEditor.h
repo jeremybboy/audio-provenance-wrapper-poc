@@ -28,6 +28,8 @@ private:
     juce::Label sampleRateLabel;
     juce::Label bufferSizeLabel;
     juce::Label lastBufferSeenLabel;
+    juce::Label hashChainLabel;
+    juce::Label lastHashLabel;
     juce::Label scopeLabel;
     std::uint64_t lastRenderedBufferSeenMilliseconds = 0;
     juce::String lastRenderedBufferSeenText = "never";

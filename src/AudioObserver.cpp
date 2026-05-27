@@ -1,0 +1,460 @@
+#include "AudioObserver.h"
+#include "ObservationEvent.h"
+
+#include <juce_cryptography/juce_cryptography.h>
+#include <cmath>
+
+namespace apw
+{
+
+AudioObserver::AudioObserver()
+    : juce::Thread ("AudioObserver"),
+      audioFifo (kFifoCapacity),
+      audioFifoBuffer (static_cast<size_t> (kFifoCapacity), 0.0f),
+      windowBuffer (static_cast<size_t> (kWindowSize), 0.0f),
+      midiFifo (kMidiQueueSize),
+      midiFifoBuffer (static_cast<size_t> (kMidiQueueSize)),
+      fft (kFFTOrder),
+      fftWorkspace (static_cast<size_t> (kWindowSize * 2), 0.0f)
+{
+}
+
+AudioObserver::~AudioObserver()
+{
+    stop();
+}
+
+void AudioObserver::start (EventCallback callback)
+{
+    eventCallback = std::move (callback);
+    startThread (juce::Thread::Priority::normal);
+}
+
+void AudioObserver::stop()
+{
+    signalThreadShouldExit();
+    stopThread (2000);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Real-time thread interface
+// ──────────────────────────────────────────────────────────────────────
+
+void AudioObserver::pushAudioBlock (const float* const* channelData,
+                                     int numChannels, int numSamples)
+{
+    if (numChannels <= 0 || numSamples <= 0)
+        return;
+
+    int start1, size1, start2, size2;
+    audioFifo.prepareToWrite (numSamples, start1, size1, start2, size2);
+
+    const float gain = 1.0f / static_cast<float> (numChannels);
+
+    auto writeMono = [&] (int destStart, int count, int srcOffset)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            float sum = 0.0f;
+            for (int ch = 0; ch < numChannels; ++ch)
+                sum += channelData[ch][srcOffset + i];
+            audioFifoBuffer[static_cast<size_t> (destStart + i)] = sum * gain;
+        }
+    };
+
+    if (size1 > 0) writeMono (start1, size1, 0);
+    if (size2 > 0) writeMono (start2, size2, size1);
+
+    audioFifo.finishedWrite (size1 + size2);
+}
+
+void AudioObserver::pushMidiMessages (const juce::MidiBuffer& midi)
+{
+    for (const auto metadata : midi)
+    {
+        const auto msg = metadata.getMessage();
+        MidiRecord record {};
+
+        if (msg.isNoteOn())
+        {
+            record.type  = 0x90;
+            record.data1 = static_cast<std::uint8_t> (msg.getNoteNumber());
+            record.data2 = static_cast<std::uint8_t> (msg.getVelocity());
+        }
+        else if (msg.isNoteOff())
+        {
+            record.type  = 0x80;
+            record.data1 = static_cast<std::uint8_t> (msg.getNoteNumber());
+            record.data2 = static_cast<std::uint8_t> (msg.getVelocity());
+        }
+        else if (msg.isController())
+        {
+            record.type  = 0xB0;
+            record.data1 = static_cast<std::uint8_t> (msg.getControllerNumber());
+            record.data2 = static_cast<std::uint8_t> (msg.getControllerValue());
+        }
+        else if (msg.isProgramChange())
+        {
+            record.type  = 0xC0;
+            record.data1 = static_cast<std::uint8_t> (msg.getProgramChangeNumber());
+            record.data2 = 0;
+        }
+        else
+        {
+            continue;
+        }
+
+        record.channel = static_cast<std::uint8_t> (msg.getChannel());
+
+        int s1, sz1, s2, sz2;
+        midiFifo.prepareToWrite (1, s1, sz1, s2, sz2);
+        if (sz1 > 0) midiFifoBuffer[static_cast<size_t> (s1)] = record;
+        midiFifo.finishedWrite (sz1 + sz2);
+    }
+}
+
+void AudioObserver::updateTransportState (juce::AudioPlayHead* playHead)
+{
+    if (playHead == nullptr)
+        return;
+
+    if (auto pos = playHead->getPosition())
+    {
+        transportPlaying.store (pos->getIsPlaying(), std::memory_order_relaxed);
+        transportRecording.store (pos->getIsRecording(), std::memory_order_relaxed);
+        transportLooping.store (pos->getIsLooping(), std::memory_order_relaxed);
+
+        if (auto samples = pos->getTimeInSamples())
+            transportSamplePos.store (static_cast<juce::int64> (*samples),
+                                       std::memory_order_relaxed);
+
+        if (auto bpm = pos->getBpm())
+            transportBpmX100.store (static_cast<int> (*bpm * 100.0),
+                                     std::memory_order_relaxed);
+    }
+}
+
+void AudioObserver::updateSessionConfig (int sampleRate, int channelCount, int bufferSize)
+{
+    sessionSampleRate.store (sampleRate, std::memory_order_relaxed);
+    sessionChannelCount.store (channelCount, std::memory_order_relaxed);
+    sessionBufferSize.store (bufferSize, std::memory_order_relaxed);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Background observation thread
+// ──────────────────────────────────────────────────────────────────────
+
+void AudioObserver::run()
+{
+    while (! threadShouldExit())
+    {
+        while (audioFifo.getNumReady() >= kWindowSize && ! threadShouldExit())
+        {
+            int start1, size1, start2, size2;
+            audioFifo.prepareToRead (kWindowSize, start1, size1, start2, size2);
+
+            if (size1 > 0)
+                std::copy (audioFifoBuffer.begin() + start1,
+                           audioFifoBuffer.begin() + start1 + size1,
+                           windowBuffer.begin());
+            if (size2 > 0)
+                std::copy (audioFifoBuffer.begin() + start2,
+                           audioFifoBuffer.begin() + start2 + size2,
+                           windowBuffer.begin() + size1);
+
+            audioFifo.finishedRead (size1 + size2);
+
+            processWindow (windowBuffer.data(), kWindowSize);
+        }
+
+        drainMidiEvents();
+        checkTransportChanges();
+        checkSessionConfigChanges();
+
+        juce::Thread::sleep (5);
+    }
+}
+
+void AudioObserver::processWindow (const float* data, int numSamples)
+{
+    const auto timestampMs = static_cast<std::uint64_t> (
+        juce::Time::getMillisecondCounterHiRes());
+    const auto samplePos = transportSamplePos.load (std::memory_order_relaxed);
+    const auto sampleRate = sessionSampleRate.load (std::memory_order_relaxed);
+    const auto channels   = sessionChannelCount.load (std::memory_order_relaxed);
+    const auto bpmX100    = transportBpmX100.load (std::memory_order_relaxed);
+
+    const auto rms      = computeRMS (data, numSamples);
+    const auto zcr      = computeZeroCrossingRate (data, numSamples);
+    const auto centroid = computeSpectralCentroid (data, numSamples);
+    const bool hasAudio = rms > kSilenceThreshold;
+
+    auto windowHash = computeChainedHash (data, numSamples);
+    auto prevHash   = previousHash.isEmpty() ? juce::String ("genesis") : previousHash;
+
+    // ── buffer_hash event ──
+    if (eventCallback)
+    {
+        auto json = buildJsonEvent (EventTypes::bufferHash, timestampMs, samplePos,
+        {
+            { "window_hash",          windowHash },
+            { "prev_hash",            prevHash },
+            { "rms_level",            rms },
+            { "zero_crossing_rate",   zcr },
+            { "spectral_centroid_hz", centroid },
+            { "channel_count",        channels },
+            { "sample_rate_hz",       sampleRate },
+            { "window_size_samples",  numSamples },
+            { "bpm",                  bpmX100 / 100.0 }
+        });
+        eventCallback (json);
+        totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    // ── audio_transition event ──
+    if (hasAudio != prevWindowHadAudio)
+    {
+        auto direction = hasAudio ? juce::String ("silence_to_audio")
+                                  : juce::String ("audio_to_silence");
+
+        if (eventCallback)
+        {
+            auto json = buildJsonEvent (EventTypes::audioTransition, timestampMs, samplePos,
+            {
+                { "direction",     direction },
+                { "boundary_hash", windowHash }
+            });
+            eventCallback (json);
+            totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
+        }
+    }
+
+    // ── spectral_shift event ──
+    if (hasAudio && prevWindowHadAudio
+        && std::abs (centroid - prevSpectralCentroid) > kSpectralShiftThreshold)
+    {
+        if (eventCallback)
+        {
+            auto json = buildJsonEvent (EventTypes::spectralShift, timestampMs, samplePos,
+            {
+                { "prev_spectral_centroid_hz", prevSpectralCentroid },
+                { "new_spectral_centroid_hz",  centroid },
+                { "shift_magnitude",           std::abs (centroid - prevSpectralCentroid) }
+            });
+            eventCallback (json);
+            totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
+        }
+    }
+
+    previousHash = windowHash;
+    prevWindowHadAudio = hasAudio;
+    if (hasAudio)
+        prevSpectralCentroid = centroid;
+
+    totalWindowsHashed.fetch_add (1, std::memory_order_relaxed);
+
+    {
+        juce::SpinLock::ScopedLockType lock (lastHashLock);
+        lastHashHex = windowHash;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Feature computation
+// ──────────────────────────────────────────────────────────────────────
+
+juce::String AudioObserver::computeChainedHash (const float* data, int numSamples)
+{
+    juce::MemoryOutputStream mos;
+
+    auto prev = previousHash.isEmpty() ? juce::String ("genesis") : previousHash;
+    mos.write (prev.toRawUTF8(), prev.getNumBytesAsUTF8());
+    mos.write (data, static_cast<size_t> (numSamples) * sizeof (float));
+
+    juce::SHA256 hash (mos.getMemoryBlock());
+    return hash.toHexString();
+}
+
+double AudioObserver::computeRMS (const float* data, int numSamples)
+{
+    double sum = 0.0;
+    for (int i = 0; i < numSamples; ++i)
+        sum += static_cast<double> (data[i]) * static_cast<double> (data[i]);
+    return std::sqrt (sum / static_cast<double> (numSamples));
+}
+
+double AudioObserver::computeZeroCrossingRate (const float* data, int numSamples)
+{
+    if (numSamples < 2)
+        return 0.0;
+
+    int crossings = 0;
+    for (int i = 1; i < numSamples; ++i)
+    {
+        if ((data[i] >= 0.0f) != (data[i - 1] >= 0.0f))
+            ++crossings;
+    }
+    return static_cast<double> (crossings) / static_cast<double> (numSamples - 1);
+}
+
+double AudioObserver::computeSpectralCentroid (const float* data, int numSamples)
+{
+    const auto sr = sessionSampleRate.load (std::memory_order_relaxed);
+    if (sr <= 0 || numSamples <= 0)
+        return 0.0;
+
+    std::fill (fftWorkspace.begin(), fftWorkspace.end(), 0.0f);
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const float w = 0.5f * (1.0f - std::cos (2.0f * juce::MathConstants<float>::pi
+                                                   * static_cast<float> (i)
+                                                   / static_cast<float> (numSamples - 1)));
+        fftWorkspace[static_cast<size_t> (i)] = data[i] * w;
+    }
+
+    fft.performFrequencyOnlyForwardTransform (fftWorkspace.data());
+
+    double weightedSum  = 0.0;
+    double magnitudeSum = 0.0;
+    const int numBins   = numSamples / 2;
+    const double binHz  = static_cast<double> (sr) / static_cast<double> (numSamples);
+
+    for (int i = 1; i < numBins; ++i)
+    {
+        const double freq = static_cast<double> (i) * binHz;
+        const double mag  = static_cast<double> (fftWorkspace[static_cast<size_t> (i)]);
+        weightedSum  += freq * mag;
+        magnitudeSum += mag;
+    }
+
+    return magnitudeSum > 0.0 ? weightedSum / magnitudeSum : 0.0;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// MIDI / transport / config change detection
+// ──────────────────────────────────────────────────────────────────────
+
+void AudioObserver::drainMidiEvents()
+{
+    const auto timestampMs = static_cast<std::uint64_t> (
+        juce::Time::getMillisecondCounterHiRes());
+    const auto samplePos = transportSamplePos.load (std::memory_order_relaxed);
+
+    while (midiFifo.getNumReady() > 0)
+    {
+        int start1, size1, start2, size2;
+        midiFifo.prepareToRead (1, start1, size1, start2, size2);
+
+        if (size1 > 0)
+        {
+            const auto& rec = midiFifoBuffer[static_cast<size_t> (start1)];
+
+            juce::String midiType;
+            switch (rec.type)
+            {
+                case 0x90: midiType = "note_on";         break;
+                case 0x80: midiType = "note_off";        break;
+                case 0xB0: midiType = "control_change";  break;
+                case 0xC0: midiType = "program_change";  break;
+                default:   midiType = "unknown";          break;
+            }
+
+            if (eventCallback)
+            {
+                auto json = buildJsonEvent (EventTypes::midiEvent, timestampMs, samplePos,
+                {
+                    { "midi_event_type", midiType },
+                    { "midi_channel",    static_cast<int> (rec.channel) },
+                    { "midi_note_or_cc", static_cast<int> (rec.data1) },
+                    { "midi_value",      static_cast<int> (rec.data2) }
+                });
+                eventCallback (json);
+                totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
+            }
+        }
+
+        midiFifo.finishedRead (size1 + size2);
+    }
+}
+
+void AudioObserver::checkTransportChanges()
+{
+    const bool playing   = transportPlaying.load (std::memory_order_relaxed);
+    const bool recording = transportRecording.load (std::memory_order_relaxed);
+    const bool looping   = transportLooping.load (std::memory_order_relaxed);
+    const int  bpmX100   = transportBpmX100.load (std::memory_order_relaxed);
+
+    if (playing == prevTransportPlaying && recording == prevTransportRecording
+        && looping == prevTransportLooping && bpmX100 == prevTransportBpmX100)
+        return;
+
+    const auto timestampMs = static_cast<std::uint64_t> (
+        juce::Time::getMillisecondCounterHiRes());
+    const auto samplePos = transportSamplePos.load (std::memory_order_relaxed);
+
+    juce::String state = recording ? "recording" : (playing ? "playing" : "stopped");
+
+    if (eventCallback)
+    {
+        auto json = buildJsonEvent (EventTypes::transportChange, timestampMs, samplePos,
+        {
+            { "transport_state", state },
+            { "is_looping",      looping },
+            { "bpm",             bpmX100 / 100.0 }
+        });
+        eventCallback (json);
+        totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    prevTransportPlaying   = playing;
+    prevTransportRecording = recording;
+    prevTransportLooping   = looping;
+    prevTransportBpmX100   = bpmX100;
+}
+
+void AudioObserver::checkSessionConfigChanges()
+{
+    const int sr = sessionSampleRate.load (std::memory_order_relaxed);
+    const int ch = sessionChannelCount.load (std::memory_order_relaxed);
+
+    if (sr == prevSessionSampleRate && ch == prevSessionChannelCount)
+        return;
+
+    const auto timestampMs = static_cast<std::uint64_t> (
+        juce::Time::getMillisecondCounterHiRes());
+    const auto samplePos = transportSamplePos.load (std::memory_order_relaxed);
+    const auto bpmX100   = transportBpmX100.load (std::memory_order_relaxed);
+
+    if (eventCallback)
+    {
+        auto json = buildJsonEvent (EventTypes::sessionConfig, timestampMs, samplePos,
+        {
+            { "sample_rate_hz", sr },
+            { "channel_count",  ch },
+            { "bpm",            bpmX100 / 100.0 }
+        });
+        eventCallback (json);
+        totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    prevSessionSampleRate   = sr;
+    prevSessionChannelCount = ch;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Stats
+// ──────────────────────────────────────────────────────────────────────
+
+int AudioObserver::getWindowSize() const noexcept         { return kWindowSize; }
+int AudioObserver::getTotalWindowsHashed() const noexcept { return totalWindowsHashed.load (std::memory_order_relaxed); }
+int AudioObserver::getTotalEventsEmitted() const noexcept { return totalEventsEmitted.load (std::memory_order_relaxed); }
+
+juce::String AudioObserver::getLastHash() const
+{
+    juce::SpinLock::ScopedLockType lock (lastHashLock);
+    return lastHashHex;
+}
+
+} // namespace apw
