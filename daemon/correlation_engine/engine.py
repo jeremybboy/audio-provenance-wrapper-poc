@@ -1,0 +1,376 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LayerEvent:
+    """A single event from any observation layer."""
+
+    layer: str
+    event_type: str
+    timestamp_ms: int
+    data: dict[str, object]
+
+
+@dataclass
+class CorrelationCandidate:
+    """A group of temporally-aligned events from multiple layers."""
+
+    window_center_ms: int
+    events: list[LayerEvent] = field(default_factory=list)
+
+    @property
+    def layers_present(self) -> set[str]:
+        return {e.layer for e in self.events}
+
+    @property
+    def span_ms(self) -> int:
+        if len(self.events) < 2:
+            return 0
+        timestamps = [e.timestamp_ms for e in self.events]
+        return max(timestamps) - min(timestamps)
+
+
+@dataclass
+class CompositeEdit:
+    """An edit event inferred from cross-layer correlation."""
+
+    edit_type: str
+    confidence: float
+    timestamp_ms: int
+    contributing_events: list[dict[str, object]]
+    notes: list[str] = field(default_factory=list)
+
+    def to_event_dict(self) -> dict[str, object]:
+        return {
+            "event_type": "composite_edit",
+            "proof_level": "inferred",
+            "timestamp_ms": self.timestamp_ms,
+            "edit_type": self.edit_type,
+            "confidence": round(self.confidence, 3),
+            "contributing_events": self.contributing_events,
+            "notes": self.notes,
+        }
+
+
+class CorrelationRule:
+    """Base class for correlation rules.
+
+    Each rule examines a CorrelationCandidate and optionally returns a
+    CompositeEdit if the pattern matches.
+    """
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        raise NotImplementedError
+
+
+class ClipPasteRule(CorrelationRule):
+    """Detect clip paste: Cmd+V followed by silence-to-audio transition."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_paste_shortcut = any(
+            e.layer == "input_capture"
+            and e.data.get("probable_operation") == "paste"
+            for e in candidate.events
+        )
+        has_audio_start = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "audio_transition"
+            and e.data.get("direction") == "silence_to_audio"
+            for e in candidate.events
+        )
+        if not (has_paste_shortcut and has_audio_start):
+            return None
+
+        confidence = 0.85
+        confidence += _alignment_bonus(candidate)
+        confidence += _layer_bonus(candidate, required=2)
+
+        return CompositeEdit(
+            edit_type="clip_paste",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+        )
+
+
+class ClipDeleteRule(CorrelationRule):
+    """Detect clip delete: Delete key followed by audio-to-silence transition."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_delete = any(
+            e.layer == "input_capture"
+            and e.data.get("probable_operation") == "delete"
+            for e in candidate.events
+        )
+        has_audio_stop = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "audio_transition"
+            and e.data.get("direction") == "audio_to_silence"
+            for e in candidate.events
+        )
+        if not (has_delete and has_audio_stop):
+            return None
+
+        confidence = 0.80
+        confidence += _alignment_bonus(candidate)
+        confidence += _layer_bonus(candidate, required=2)
+
+        return CompositeEdit(
+            edit_type="clip_delete",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+        )
+
+
+class EffectChangeRule(CorrelationRule):
+    """Detect effect change: mixer visual change + spectral shift, no silence transition."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_mixer_change = any(
+            e.layer == "screen_observer"
+            and e.event_type == "screen_mixer_changed"
+            for e in candidate.events
+        )
+        has_spectral_shift = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "spectral_shift"
+            for e in candidate.events
+        )
+        has_silence_transition = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "audio_transition"
+            for e in candidate.events
+        )
+        if not (has_mixer_change and has_spectral_shift and not has_silence_transition):
+            return None
+
+        confidence = 0.70
+        confidence += _alignment_bonus(candidate)
+        confidence += _layer_bonus(candidate, required=2)
+
+        return CompositeEdit(
+            edit_type="effect_change",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+        )
+
+
+class SampleImportRule(CorrelationRule):
+    """Detect confirmed sample import: file observed + project ref + stream correlation."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        sample_event = None
+        for e in candidate.events:
+            if e.layer == "sample_watcher" and e.event_type == "sample_file_observed":
+                sample_event = e
+                break
+
+        has_project_ref = any(
+            e.layer == "project_differ"
+            and e.event_type == "project_sample_ref_added"
+            for e in candidate.events
+        )
+        has_correlation = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "ingredient_correlation"
+            for e in candidate.events
+        )
+
+        if sample_event is None:
+            return None
+
+        confidence = 0.60
+        if has_project_ref:
+            confidence += 0.15
+        if has_correlation:
+            confidence += 0.15
+        confidence += _layer_bonus(candidate, required=1)
+
+        return CompositeEdit(
+            edit_type="sample_import_confirmed",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+            notes=[f"Sample: {sample_event.data.get('file_name', 'unknown')}"],
+        )
+
+
+class UndoRule(CorrelationRule):
+    """Detect undo: Cmd+Z followed by content hash matching an earlier window."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_undo = any(
+            e.layer == "input_capture"
+            and e.data.get("probable_operation") == "undo"
+            for e in candidate.events
+        )
+        if not has_undo:
+            return None
+
+        confidence = 0.75
+        confidence += _alignment_bonus(candidate)
+
+        return CompositeEdit(
+            edit_type="undo",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+            notes=["Hash chain rollback detection not yet implemented."],
+        )
+
+
+class ArrangementEditRule(CorrelationRule):
+    """Detect arrangement edit: project diff + screen change + input activity."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_project_diff = any(
+            e.layer == "project_differ"
+            and e.event_type == "project_diff"
+            for e in candidate.events
+        )
+        has_screen_change = any(
+            e.layer == "screen_observer"
+            and e.event_type == "screen_arrangement_changed"
+            for e in candidate.events
+        )
+        has_input = any(
+            e.layer == "input_capture"
+            for e in candidate.events
+        )
+
+        if not has_project_diff:
+            return None
+
+        confidence = 0.65
+        if has_screen_change:
+            confidence += 0.05
+        if has_input:
+            confidence += 0.05
+        confidence += _layer_bonus(candidate, required=1)
+
+        diff_data = {}
+        for e in candidate.events:
+            if e.layer == "project_differ" and e.event_type == "project_diff":
+                diff_data = e.data
+                break
+
+        return CompositeEdit(
+            edit_type="arrangement_edit",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+            notes=[
+                f"clips +{diff_data.get('clips_added', 0)}"
+                f"/-{diff_data.get('clips_removed', 0)}"
+                f"/~{diff_data.get('clips_modified', 0)}"
+            ],
+        )
+
+
+def _alignment_bonus(candidate: CorrelationCandidate) -> float:
+    if candidate.span_ms < 200:
+        return 0.05
+    if candidate.span_ms > 1000:
+        return -0.10
+    return 0.0
+
+
+def _layer_bonus(candidate: CorrelationCandidate, required: int) -> float:
+    extra = len(candidate.layers_present) - required
+    return max(0.0, extra * 0.05)
+
+
+def _summarize_events(candidate: CorrelationCandidate) -> list[dict[str, object]]:
+    return [
+        {
+            "layer": e.layer,
+            "event_type": e.event_type,
+            "timestamp_ms": e.timestamp_ms,
+        }
+        for e in candidate.events
+    ]
+
+
+DEFAULT_RULES: list[CorrelationRule] = [
+    ClipPasteRule(),
+    ClipDeleteRule(),
+    EffectChangeRule(),
+    SampleImportRule(),
+    UndoRule(),
+    ArrangementEditRule(),
+]
+
+
+class CorrelationEngine:
+    """Consumes events from all layers and emits composite edit evidence.
+
+    Events are buffered in a sliding time window. When the window advances,
+    temporally-aligned groups are evaluated against correlation rules.
+    """
+
+    def __init__(
+        self,
+        window_ms: int = 2000,
+        rules: list[CorrelationRule] | None = None,
+        evidence_path: Path = Path("evidence/composite_events.jsonl"),
+    ) -> None:
+        self.window_ms = window_ms
+        self.rules = rules or list(DEFAULT_RULES)
+        self.evidence_path = evidence_path.expanduser()
+        self._buffer: deque[LayerEvent] = deque()
+        self._emitted_count = 0
+
+    def ingest(self, event: LayerEvent) -> list[CompositeEdit]:
+        """Add an event and return any composite edits triggered."""
+        self._buffer.append(event)
+        self._expire_old_events(event.timestamp_ms)
+        return self._evaluate()
+
+    def _expire_old_events(self, now_ms: int) -> None:
+        cutoff = now_ms - self.window_ms
+        while self._buffer and self._buffer[0].timestamp_ms < cutoff:
+            self._buffer.popleft()
+
+    def _evaluate(self) -> list[CompositeEdit]:
+        if len(self._buffer) < 2:
+            return []
+
+        candidate = CorrelationCandidate(
+            window_center_ms=self._buffer[-1].timestamp_ms,
+            events=list(self._buffer),
+        )
+
+        results: list[CompositeEdit] = []
+        for rule in self.rules:
+            composite = rule.evaluate(candidate)
+            if composite is not None and composite.confidence >= 0.5:
+                results.append(composite)
+                self._write_event(composite)
+                self._emitted_count += 1
+
+        return results
+
+    def _write_event(self, composite: CompositeEdit) -> None:
+        self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.evidence_path.open("a", encoding="utf-8") as f:
+            json.dump(composite.to_event_dict(), f, separators=(",", ":"))
+            f.write("\n")
+
+    @property
+    def emitted_count(self) -> int:
+        return self._emitted_count
+
+    @property
+    def buffer_size(self) -> int:
+        return len(self._buffer)
