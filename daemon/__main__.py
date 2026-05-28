@@ -371,6 +371,7 @@ class Daemon:
         if snap is not None:
             manifest["session_facts"] = {
                 "bpm": snap.transport_bpm,
+                "time_signature": f"{snap.transport_time_signature[0]}/{snap.transport_time_signature[1]}",
                 "loop_on": snap.transport_loop_on,
                 "track_count": snap.track_count,
                 "clip_count": snap.clip_count,
@@ -380,13 +381,28 @@ class Daemon:
                         "name": t.name,
                         "type": t.track_type,
                         "devices": list(t.devices),
+                        "device_presets": list(t.device_presets),
                         "sample_paths": list(t.sample_paths),
+                        "clips": [
+                            {
+                                "name": c.name,
+                                "position_beats": c.position_beats,
+                                "length_beats": c.length_beats,
+                                "sample_ref": c.sample_ref,
+                                "warp_on": c.warp_on,
+                                "is_midi": c.is_midi,
+                            }
+                            for c in t.clips
+                        ],
                         "clip_count": t.clip_count,
                         "midi_note_count": t.midi_note_count,
                         "automation_point_count": t.automation_point_count,
                         "routing_input": t.routing_input,
                         "routing_output": t.routing_output,
+                        "sends": [{"target": s.target, "level": s.level} for s in t.sends],
                         "group_id": t.group_id,
+                        "is_frozen": t.is_frozen,
+                        "color_index": t.color_index,
                     }
                     for t in snap.tracks
                 ],

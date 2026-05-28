@@ -15,19 +15,44 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class ClipInfo:
+    """Per-clip metadata extracted from the .als XML."""
+
+    name: str
+    position_beats: float
+    length_beats: float
+    sample_ref: str
+    warp_on: bool
+    is_midi: bool
+
+
+@dataclass(frozen=True)
+class SendInfo:
+    """Send/return routing for a track."""
+
+    target: str
+    level: float
+
+
+@dataclass(frozen=True)
 class TrackInfo:
     """Rich per-track metadata extracted from the .als XML."""
 
     name: str
     track_type: str
     devices: tuple[str, ...]
+    device_presets: tuple[str, ...]
     sample_paths: tuple[str, ...]
+    clips: tuple[ClipInfo, ...]
     clip_count: int
     automation_point_count: int
     midi_note_count: int
     group_id: str
     routing_input: str
     routing_output: str
+    sends: tuple[SendInfo, ...]
+    is_frozen: bool
+    color_index: int
 
 
 @dataclass(frozen=True)
@@ -46,6 +71,7 @@ class ProjectSnapshot:
     midi_note_count: int
     sample_refs: frozenset[str]
     transport_bpm: float
+    transport_time_signature: tuple[int, int]
     transport_loop_on: bool
     transport_loop_range: tuple[float, float]
     locator_count: int
@@ -136,12 +162,38 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
             track_auto = 0
             track_midi = 0
             track_devices: list[str] = []
+            track_presets: list[str] = []
             track_samples: list[str] = []
+            track_clip_infos: list[ClipInfo] = []
+            is_midi_track = track_type == "MidiTrack"
 
             for clip_slot in track.iter("ClipSlot"):
                 clip_count += 1
                 track_clips += 1
                 clip_hashes.add(hashlib.sha256(ET.tostring(clip_slot)).hexdigest()[:16])
+
+                clip_el = clip_slot.find(".//AudioClip") or clip_slot.find(".//MidiClip")
+                if clip_el is not None:
+                    clip_name_el = clip_el.find("Name")
+                    clip_name = clip_name_el.get("Value", "") if clip_name_el is not None else ""
+                    pos_el = clip_el.find("CurrentStart")
+                    pos = float(pos_el.get("Value", "0")) if pos_el is not None else 0.0
+                    end_el = clip_el.find("CurrentEnd")
+                    end = float(end_el.get("Value", "0")) if end_el is not None else 0.0
+                    warp_el = clip_el.find(".//WarpMode")
+                    warp_on = warp_el is not None
+                    clip_sample = ""
+                    clip_file_ref = clip_el.find(".//FileRef/Path")
+                    if clip_file_ref is not None:
+                        clip_sample = clip_file_ref.get("Value", "")
+                    track_clip_infos.append(ClipInfo(
+                        name=clip_name,
+                        position_beats=pos,
+                        length_beats=end - pos,
+                        sample_ref=clip_sample,
+                        warp_on=warp_on,
+                        is_midi=clip_el.tag == "MidiClip",
+                    ))
 
             for device_chain in track.iter("DeviceChain"):
                 device_hashes.add(hashlib.sha256(ET.tostring(device_chain)).hexdigest()[:16])
@@ -153,6 +205,11 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
                         if user_name_el is not None and user_name_el.get("Value"):
                             dev_name = user_name_el.get("Value", dev_name)
                         track_devices.append(dev_name)
+                        preset_name = ""
+                        preset_el = device.find(".//SelectedPresetName")
+                        if preset_el is not None:
+                            preset_name = preset_el.get("Value", "")
+                        track_presets.append(preset_name)
 
             for file_ref in track.iter("FileRef"):
                 rel = file_ref.find("RelativePath")
@@ -192,17 +249,51 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
             if output_routing is not None:
                 routing_out = output_routing.get("Value", "")
 
+            sends: list[SendInfo] = []
+            for send_holder in track.iter("TrackSendHolder"):
+                send_target = ""
+                send_level = 0.0
+                target_el = send_holder.find(".//Send/Target")
+                if target_el is not None:
+                    send_target = target_el.get("Value", "")
+                level_el = send_holder.find(".//Send/Manual")
+                if level_el is not None:
+                    try:
+                        send_level = float(level_el.get("Value", "0"))
+                    except ValueError:
+                        pass
+                if send_target:
+                    sends.append(SendInfo(target=send_target, level=send_level))
+
+            frozen = False
+            freeze_el = track.find("Freeze")
+            if freeze_el is not None:
+                frozen = freeze_el.get("Value", "false") == "true"
+
+            color_index = -1
+            color_el = track.find("ColorIndex")
+            if color_el is not None:
+                try:
+                    color_index = int(color_el.get("Value", "-1"))
+                except ValueError:
+                    pass
+
             track_infos.append(TrackInfo(
                 name=name_val,
                 track_type=track_type,
                 devices=tuple(track_devices),
+                device_presets=tuple(track_presets),
                 sample_paths=tuple(track_samples),
+                clips=tuple(track_clip_infos),
                 clip_count=track_clips,
                 automation_point_count=track_auto,
                 midi_note_count=track_midi,
                 group_id=group_id,
                 routing_input=routing_in,
                 routing_output=routing_out,
+                sends=tuple(sends),
+                is_frozen=frozen,
+                color_index=color_index,
             ))
 
     transport = live_set.find("Transport")
@@ -224,6 +315,23 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
         if loop_len_el is not None:
             loop_length = float(loop_len_el.get("Value", "0"))
 
+    time_sig_num = 4
+    time_sig_den = 4
+    ts_el = live_set.find(".//TimeSignature")
+    if ts_el is not None:
+        num_el = ts_el.find(".//Numerator")
+        den_el = ts_el.find(".//Denominator")
+        if num_el is not None:
+            try:
+                time_sig_num = int(num_el.get("Value", "4"))
+            except ValueError:
+                pass
+        if den_el is not None:
+            try:
+                time_sig_den = int(den_el.get("Value", "4"))
+            except ValueError:
+                pass
+
     locator_count = sum(1 for _ in live_set.iter("Locator"))
 
     stat = path.stat()
@@ -241,6 +349,7 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
         midi_note_count=midi_note_count,
         sample_refs=frozenset(sample_refs),
         transport_bpm=bpm,
+        transport_time_signature=(time_sig_num, time_sig_den),
         transport_loop_on=loop_on,
         transport_loop_range=(loop_start, loop_length),
         locator_count=locator_count,

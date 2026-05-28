@@ -21,6 +21,7 @@ def _make_snapshot(**overrides) -> ProjectSnapshot:
         midi_note_count=50,
         sample_refs=frozenset({"sample_a.wav"}),
         transport_bpm=120.0,
+        transport_time_signature=(4, 4),
         transport_loop_on=False,
         transport_loop_range=(0.0, 0.0),
         locator_count=2,
