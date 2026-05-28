@@ -257,29 +257,71 @@ class SoftwareProvider(HardwareProvider):
     hardware binding. An auditor can verify chain integrity but not that
     the chain was produced on a specific device.
 
-    Useful for development and for platforms without hardware security.
+    Uses HMAC-SHA256 for signing (stdlib only, no external dependencies).
+    The signing key is derived from a random seed stored on disk. This is
+    NOT equivalent to real Ed25519 but provides a functional signing flow
+    for development and testing.
     """
 
-    def __init__(self, key_path: Path = Path("~/.apw/device_key.pem")) -> None:
+    def __init__(self, key_path: Path = Path("~/.apw/device_key.bin")) -> None:
         self.key_path = key_path.expanduser()
+        self._counter = 0
+        self._seed = self._load_or_create_key()
+        self._device_id = hashlib.sha256(self._seed).hexdigest()[:16]
+        self._public_key = hashlib.sha256(b"apw-pubkey-" + self._seed).hexdigest()
+
+    def _load_or_create_key(self) -> bytes:
+        if self.key_path.exists():
+            return self.key_path.read_bytes()
+        import os
+        seed = os.urandom(32)
+        self.key_path.parent.mkdir(parents=True, exist_ok=True)
+        self.key_path.write_bytes(seed)
+        log.info("Created software signing key at %s", self.key_path)
+        return seed
 
     def device_identity(self) -> DeviceIdentity:
-        raise NotImplementedError("Software key provider not yet implemented")
+        return DeviceIdentity(
+            device_id=self._device_id,
+            public_key_hex=self._public_key,
+            algorithm="hmac-sha256",
+            created_at_ms=int(self.key_path.stat().st_mtime * 1000),
+        )
 
     def sign(self, data: bytes) -> bytes:
-        raise NotImplementedError("Software key provider not yet implemented")
+        import hmac
+        return hmac.new(self._seed, data, hashlib.sha256).digest()
 
     def verify(self, data: bytes, signature: bytes) -> bool:
-        raise NotImplementedError("Software key provider not yet implemented")
+        import hmac
+        expected = hmac.new(self._seed, data, hashlib.sha256).digest()
+        return hmac.compare_digest(expected, signature)
 
     def seal(self, plaintext: bytes) -> bytes:
-        raise NotImplementedError("Software key provider not yet implemented")
+        import hmac
+        import os
+        nonce = os.urandom(16)
+        key = hmac.new(self._seed, b"apw-seal-" + nonce, hashlib.sha256).digest()
+        sealed = bytes(a ^ b for a, b in zip(plaintext, (key * ((len(plaintext) // 32) + 1))[:len(plaintext)]))
+        tag = hmac.new(key, sealed, hashlib.sha256).digest()[:16]
+        return nonce + tag + sealed
 
-    def unseal(self, sealed: bytes) -> bytes:
-        raise NotImplementedError("Software key provider not yet implemented")
+    def unseal(self, sealed_data: bytes) -> bytes:
+        import hmac
+        if len(sealed_data) < 32:
+            raise ValueError("Sealed data too short")
+        nonce = sealed_data[:16]
+        tag = sealed_data[16:32]
+        ciphertext = sealed_data[32:]
+        key = hmac.new(self._seed, b"apw-seal-" + nonce, hashlib.sha256).digest()
+        expected_tag = hmac.new(key, ciphertext, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag, expected_tag):
+            raise ValueError("Sealed data integrity check failed")
+        return bytes(a ^ b for a, b in zip(ciphertext, (key * ((len(ciphertext) // 32) + 1))[:len(ciphertext)]))
 
     def monotonic_counter(self) -> int:
-        raise NotImplementedError("Software key provider not yet implemented")
+        self._counter += 1
+        return self._counter
 
     def clock_ms(self) -> int:
         return int(time.time() * 1000)
