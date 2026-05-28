@@ -12,6 +12,8 @@ class EventType(str, Enum):
     TRANSPORT_CHANGE = "transport_change"
     MIDI_EVENT = "midi_event"
     SESSION_CONFIG = "session_config_change"
+    SPECTRAL_PROFILE_CHANGE = "spectral_profile_change"
+    PARAMETER_CHANGE = "parameter_change"
     SAMPLE_FILE_OBSERVED = "sample_file_observed"
     INGREDIENT_CORRELATION = "ingredient_correlation"
 
@@ -41,6 +43,12 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
     EventType.TRANSPORT_CHANGE: ["transport_state"],
     EventType.MIDI_EVENT: ["midi_event_type", "midi_channel"],
     EventType.SESSION_CONFIG: ["sample_rate_hz", "channel_count"],
+    EventType.SPECTRAL_PROFILE_CHANGE: [
+        "band_low_delta",
+        "band_mid_delta",
+        "band_high_delta",
+    ],
+    EventType.PARAMETER_CHANGE: ["cc_number", "change_count"],
     EventType.SAMPLE_FILE_OBSERVED: ["sha256", "file_name"],
     EventType.INGREDIENT_CORRELATION: ["sample_sha256", "confidence"],
 }

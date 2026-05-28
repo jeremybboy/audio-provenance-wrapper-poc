@@ -48,6 +48,12 @@ private:
     static double computeZeroCrossingRate (const float* data, int numSamples);
     double computeSpectralCentroid (const float* data, int numSamples);
 
+    // 3-band spectral profile: fraction of energy in low/mid/high bands.
+    // Band boundaries (at 48 kHz): low 0-300 Hz, mid 300-4000 Hz, high 4000+ Hz.
+    struct SpectralBands { double low = 0; double mid = 0; double high = 0; };
+    SpectralBands computeSpectralBands (int numSamples);
+    static constexpr double kBandShiftThreshold = 0.15;  // 15% energy ratio change
+
     // ── Audio FIFO (lock-free: audio thread writes, observer reads) ──
     static constexpr int kFFTOrder      = 12;
     static constexpr int kWindowSize    = 1 << kFFTOrder;            // 4096
@@ -96,6 +102,20 @@ private:
     // ── Feature tracking ──
     bool   prevWindowHadAudio    = false;
     double prevSpectralCentroid  = 0.0;
+    SpectralBands prevBands {};
+
+    // ── CC parameter tracking (knob turn detection) ──
+    struct CCState
+    {
+        int lastValue     = -1;
+        int changeCount   = 0;
+        std::uint64_t firstChangeMs = 0;
+        std::uint64_t lastChangeMs  = 0;
+    };
+    static constexpr int kMaxCCTracked = 128;
+    CCState ccStates[kMaxCCTracked] {};
+    static constexpr int kKnobTurnMinChanges   = 3;
+    static constexpr std::uint64_t kKnobTurnWindowMs = 500;
 
     // ── Silence throttling ──
     // During sustained silence, hash every window (chain integrity) but
