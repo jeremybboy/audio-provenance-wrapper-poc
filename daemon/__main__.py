@@ -21,6 +21,22 @@ from daemon.sample_watcher.watcher import SampleWatcher
 
 log = logging.getLogger(__name__)
 
+_LAYER_MAP: dict[str, str] = {
+    "buffer_hash": "audio_buffer",
+    "audio_transition": "audio_buffer",
+    "spectral_shift": "audio_buffer",
+    "spectral_profile_change": "audio_buffer",
+    "transport_change": "transport",
+    "midi_event": "midi",
+    "parameter_change": "midi",
+    "session_config_change": "session",
+}
+
+
+def _event_type_to_layer(event_type: str) -> str:
+    return _LAYER_MAP.get(event_type, "audio_buffer")
+
+
 DEFAULT_UDP_PORT = 9876
 DEFAULT_EVIDENCE_DIR = Path("evidence")
 DEFAULT_SAMPLE_DIR = Path("~/Music/ProvenanceSamples")
@@ -110,9 +126,11 @@ class Daemon:
 
             self._session_events.append(event)
 
+            et = str(event.get("event_type", ""))
+            layer = _event_type_to_layer(et)
             layer_event = LayerEvent(
-                layer="audio_buffer",
-                event_type=str(event.get("event_type", "")),
+                layer=layer,
+                event_type=et,
                 timestamp_ms=int(event.get("timestamp_ms", 0)),
                 data=event,
             )
@@ -221,8 +239,7 @@ class Daemon:
                     if resolved in self._export_seen:
                         continue
 
-                    time.sleep(1.0)
-                    if not path.exists():
+                    if not self._file_is_stable(path):
                         continue
 
                     self._export_seen.add(resolved)
@@ -255,9 +272,25 @@ class Daemon:
             exported_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         ))
 
+        first_hash_ms = 0
+        last_hash_ms = 0
+        chain_root = ""
+        chain_length = 0
+        stem_sr = 0
+        stem_ch = 0
+
         for event in self._session_events:
             et = event.get("event_type")
-            if et == "sample_file_observed":
+            if et == "buffer_hash":
+                chain_length += 1
+                ts = int(event.get("timestamp_ms", 0))
+                if chain_length == 1:
+                    first_hash_ms = ts
+                    chain_root = str(event.get("prev_hash", "genesis"))
+                last_hash_ms = ts
+                stem_sr = int(event.get("sample_rate_hz", stem_sr))
+                stem_ch = int(event.get("channel_count", stem_ch))
+            elif et == "sample_file_observed":
                 builder.add_ingredient(IngredientEvidence(
                     file_name=str(event.get("file_name", "")),
                     sha256=str(event.get("sha256", "")),
@@ -268,9 +301,39 @@ class Daemon:
             elif et == "composite_edit":
                 builder.add_composite_edit(event)
 
+        if chain_length > 0:
+            builder.add_stem(StemEvidence(
+                stem_id="stem-1",
+                hash_chain_root=chain_root,
+                hash_chain_length=chain_length,
+                first_observed_ms=first_hash_ms,
+                last_observed_ms=last_hash_ms,
+                sample_rate_hz=stem_sr,
+                channel_count=stem_ch,
+                source_category="unknown",
+                proof_level="directly_observed",
+            ))
+
         manifest_path = self.manifest_dir / f"{export_path.stem}_manifest.json"
         builder.write_json(manifest_path)
         log.info("Manifest written: %s", manifest_path)
+
+    @staticmethod
+    def _file_is_stable(path: Path, checks: int = 3, interval: float = 0.5) -> bool:
+        try:
+            prev_size = path.stat().st_size
+        except OSError:
+            return False
+        for _ in range(checks):
+            time.sleep(interval)
+            try:
+                cur_size = path.stat().st_size
+            except OSError:
+                return False
+            if cur_size != prev_size:
+                return False
+            prev_size = cur_size
+        return prev_size > 0
 
     def _write_evidence(self, filename: str, event: dict[str, object]) -> None:
         path = self.evidence_dir / filename

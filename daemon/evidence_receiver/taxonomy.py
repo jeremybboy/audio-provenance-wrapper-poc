@@ -16,6 +16,11 @@ class EventType(str, Enum):
     PARAMETER_CHANGE = "parameter_change"
     SAMPLE_FILE_OBSERVED = "sample_file_observed"
     INGREDIENT_CORRELATION = "ingredient_correlation"
+    COMPOSITE_EDIT = "composite_edit"
+    FORGERY_ANALYSIS = "forgery_analysis"
+    PROJECT_DIFF = "project_diff"
+    PROJECT_SAVE_DETECTED = "project_save_detected"
+    LAYER_UNAVAILABLE = "layer_unavailable"
 
 
 class ProofLevel(str, Enum):
@@ -51,6 +56,11 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
     EventType.PARAMETER_CHANGE: ["cc_number", "change_count"],
     EventType.SAMPLE_FILE_OBSERVED: ["sha256", "file_name"],
     EventType.INGREDIENT_CORRELATION: ["sample_sha256", "confidence"],
+    EventType.COMPOSITE_EDIT: ["edit_type", "confidence", "contributing_events"],
+    EventType.FORGERY_ANALYSIS: ["suspicion_score", "flags"],
+    EventType.PROJECT_DIFF: ["clips_added", "clips_removed"],
+    EventType.PROJECT_SAVE_DETECTED: ["file_hash"],
+    EventType.LAYER_UNAVAILABLE: ["layer", "reason"],
 }
 
 _VALID_EVENT_TYPES = frozenset(e.value for e in EventType)

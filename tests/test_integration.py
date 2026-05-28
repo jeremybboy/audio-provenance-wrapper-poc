@@ -122,6 +122,12 @@ class DaemonIntegrationTests(unittest.TestCase):
             self.assertIn("apw:unobserved", manifest)
             self.assertIn("c2pa_mapping", manifest)
 
+            stems = manifest.get("observed_stems", [])
+            self.assertEqual(len(stems), 1, "Expected 1 observed stem from buffer_hash events")
+            self.assertEqual(stems[0]["hash_chain_root"], "genesis")
+            self.assertEqual(stems[0]["hash_chain_length"], 2)
+            self.assertEqual(stems[0]["sample_rate_hz"], 44100)
+
             daemon._stop.set()
 
     def test_sample_detection_feeds_manifest(self):
@@ -229,6 +235,64 @@ class SoftwareProviderTests(unittest.TestCase):
             self.assertEqual(p1.device_identity().device_id, p2.device_identity().device_id)
             sig = p1.sign(b"data")
             self.assertTrue(p2.verify(b"data", sig))
+
+
+class VerifyTests(unittest.TestCase):
+    def test_valid_manifest_passes(self):
+        from daemon.verify import verify_manifest
+        from daemon.manifest_builder.builder import ManifestBuilder, StemEvidence, ExportEvidence
+
+        builder = ManifestBuilder(session_id="test")
+        builder.add_stem(StemEvidence(
+            stem_id="s1", hash_chain_root="abc", hash_chain_length=10,
+            first_observed_ms=0, last_observed_ms=1000, sample_rate_hz=44100,
+            channel_count=2, source_category="unknown", proof_level="directly_observed",
+        ))
+        builder.set_export(ExportEvidence(
+            file_path="/tmp/x.wav", file_name="x.wav", sha256="dead",
+            format="wav", file_size_bytes=100, duration_seconds=1.0,
+            exported_at="2026-05-28T00:00:00Z",
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "m.json"
+            builder.write_json(p)
+            errors = verify_manifest(p)
+            self.assertEqual(errors, [])
+
+    def test_empty_manifest_fails(self):
+        from daemon.verify import verify_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "m.json"
+            p.write_text("{}")
+            errors = verify_manifest(p)
+            self.assertTrue(len(errors) > 0)
+
+    def test_valid_hash_chain_passes(self):
+        from daemon.verify import verify_hash_chain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "e.jsonl"
+            events = [
+                {"event_type": "buffer_hash", "window_hash": "aaa", "prev_hash": "genesis", "timestamp_ms": 100},
+                {"event_type": "buffer_hash", "window_hash": "bbb", "prev_hash": "aaa", "timestamp_ms": 200},
+            ]
+            p.write_text("\n".join(json.dumps(e) for e in events))
+            errors = verify_hash_chain(p)
+            self.assertEqual(errors, [])
+
+    def test_broken_hash_chain_fails(self):
+        from daemon.verify import verify_hash_chain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "e.jsonl"
+            events = [
+                {"event_type": "buffer_hash", "window_hash": "aaa", "prev_hash": "genesis", "timestamp_ms": 100},
+                {"event_type": "buffer_hash", "window_hash": "bbb", "prev_hash": "WRONG", "timestamp_ms": 200},
+            ]
+            p.write_text("\n".join(json.dumps(e) for e in events))
+            errors = verify_hash_chain(p)
+            self.assertTrue(any("chain_break" in e for e in errors))
 
 
 def _write_test_wav(path: Path) -> None:
