@@ -255,20 +255,9 @@ class VerifyTests(unittest.TestCase):
         ))
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "m.json"
-            manifest = builder.build()
-            manifest["evidence_binding"] = {"evidence_file_hashes": {}, "last_window_hash": "abc", "chain_length": 10}
-            manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-            import hashlib as _hl
-            manifest["manifest_signature"] = {
-                "algorithm": "hmac-sha256",
-                "device_id": "test",
-                "public_key_hex": "test",
-                "signature_hex": "test",
-                "signed_content_hash": _hl.sha256(manifest_bytes).hexdigest(),
-            }
-            p.write_text(json.dumps(manifest, indent=2))
-            errors = verify_manifest(p)
-            self.assertEqual(errors, [])
+            builder.write_json(p)
+            result = verify_manifest(p)
+            self.assertTrue(result.passed)
 
     def test_empty_manifest_fails(self):
         from daemon.verify import verify_manifest
@@ -276,8 +265,8 @@ class VerifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "m.json"
             p.write_text("{}")
-            errors = verify_manifest(p)
-            self.assertTrue(len(errors) > 0)
+            result = verify_manifest(p)
+            self.assertFalse(result.passed)
 
     def test_valid_hash_chain_passes(self):
         from daemon.verify import verify_hash_chain
@@ -289,8 +278,8 @@ class VerifyTests(unittest.TestCase):
                 {"event_type": "buffer_hash", "window_hash": "bbb", "prev_hash": "aaa", "timestamp_ms": 200},
             ]
             p.write_text("\n".join(json.dumps(e) for e in events))
-            errors = verify_hash_chain(p)
-            self.assertEqual(errors, [])
+            result = verify_hash_chain(p)
+            self.assertTrue(result.passed)
 
     def test_broken_hash_chain_fails(self):
         from daemon.verify import verify_hash_chain
@@ -302,8 +291,9 @@ class VerifyTests(unittest.TestCase):
                 {"event_type": "buffer_hash", "window_hash": "bbb", "prev_hash": "WRONG", "timestamp_ms": 200},
             ]
             p.write_text("\n".join(json.dumps(e) for e in events))
-            errors = verify_hash_chain(p)
-            self.assertTrue(any("chain_break" in e for e in errors))
+            result = verify_hash_chain(p)
+            self.assertFalse(result.passed)
+            self.assertTrue(any(f.code == "chain_break" for f in result.errors))
 
 
 def _write_test_wav(path: Path) -> None:
