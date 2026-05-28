@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import socket
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from daemon.correlation_engine.engine import CorrelationEngine, LayerEvent
 from daemon.evidence_receiver.receiver import EvidenceReceiver
-from daemon.evidence_receiver.taxonomy import validate_event
+from daemon.hardware_attestation.provider import SoftwareProvider, detect_provider
 from daemon.manifest_builder.builder import (
     ExportEvidence,
     IngredientEvidence,
@@ -80,8 +81,32 @@ class Daemon:
         self.project_path = project_path
         self.export_dir = export_dir.expanduser() if export_dir else None
         self._export_seen: set[str] = set()
+        self._session_lock = threading.Lock()
         self._session_events: list[dict[str, object]] = []
+        self._active_layers: set[str] = {"audio_buffer", "sample_watcher"}
+        self._latest_project_snapshot = None
         self._stop = threading.Event()
+
+        try:
+            self._hw_provider = detect_provider()
+        except Exception:
+            self._hw_provider = SoftwareProvider(
+                key_path=Path("~/.apw/device_key.bin")
+            )
+
+    def _append_event(self, event: dict[str, object]) -> None:
+        with self._session_lock:
+            self._session_events.append(event)
+
+    def _correlate(self, layer_event: LayerEvent) -> None:
+        try:
+            composites = self.correlation.ingest(layer_event)
+        except Exception:
+            log.exception("Correlation engine error")
+            return
+        for c in composites:
+            log.info("Composite edit: %s (%.2f)", c.edit_type, c.confidence)
+            self._append_event(c.to_event_dict())
 
     def run(self) -> None:
         threads: list[threading.Thread] = [
@@ -90,6 +115,7 @@ class Daemon:
         ]
 
         if self.project_path and self.project_path.exists():
+            self._active_layers.add("project_differ")
             threads.append(
                 threading.Thread(target=self._run_project_watcher, name="project-watcher", daemon=True)
             )
@@ -116,15 +142,20 @@ class Daemon:
 
         while not self._stop.is_set():
             try:
-                data, _addr = self.receiver.sock.recvfrom(4096)
+                data, _addr = self.receiver.sock.recvfrom(65535)
             except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                log.exception("UDP socket error")
                 continue
 
             event = self.receiver.process_packet(data)
             if event is None:
                 continue
 
-            self._session_events.append(event)
+            self._append_event(event)
 
             et = str(event.get("event_type", ""))
             layer = _event_type_to_layer(et)
@@ -134,19 +165,23 @@ class Daemon:
                 timestamp_ms=int(event.get("timestamp_ms", 0)),
                 data=event,
             )
-            composites = self.correlation.ingest(layer_event)
-            for c in composites:
-                log.info("Composite edit: %s (%.2f)", c.edit_type, c.confidence)
+            self._correlate(layer_event)
 
     def _run_sample_watcher(self) -> None:
         self.sample_watcher.mark_existing_seen()
         log.info("Sample watcher on %s", self.sample_watcher.watch_dir)
 
         while not self._stop.is_set():
-            events = self.sample_watcher.scan_once()
+            try:
+                events = self.sample_watcher.scan_once()
+            except Exception:
+                log.exception("Sample watcher error")
+                time.sleep(self.sample_watcher.poll_interval_seconds)
+                continue
+
             for event in events:
                 log.info("Sample detected: %s", event.get("file_name"))
-                self._session_events.append(event)
+                self._append_event(event)
 
                 layer_event = LayerEvent(
                     layer="sample_watcher",
@@ -154,12 +189,12 @@ class Daemon:
                     timestamp_ms=int(time.time() * 1000),
                     data=event,
                 )
-                self.correlation.ingest(layer_event)
+                self._correlate(layer_event)
 
             time.sleep(self.sample_watcher.poll_interval_seconds)
 
     def _run_project_watcher(self) -> None:
-        from daemon.project_differ.differ import ProjectWatcher, extract_snapshot, compute_diff
+        from daemon.project_differ.differ import extract_snapshot, compute_diff
 
         log.info("Project watcher on %s", self.project_path)
         prev_snapshot = None
@@ -184,7 +219,7 @@ class Daemon:
                 if prev_snapshot is not None:
                     diff = compute_diff(prev_snapshot, snapshot)
                     if diff.has_changes():
-                        diff_event = {
+                        diff_event: dict[str, object] = {
                             "event_type": "project_diff",
                             "proof_level": "directly_observed",
                             "timestamp_ms": int(time.time() * 1000),
@@ -201,7 +236,7 @@ class Daemon:
                             "bpm_changed": diff.bpm_changed,
                         }
                         self._write_evidence("project_diff_events.jsonl", diff_event)
-                        self._session_events.append(diff_event)
+                        self._append_event(diff_event)
 
                         layer_event = LayerEvent(
                             layer="project_differ",
@@ -209,13 +244,14 @@ class Daemon:
                             timestamp_ms=int(time.time() * 1000),
                             data=diff_event,
                         )
-                        self.correlation.ingest(layer_event)
+                        self._correlate(layer_event)
                         log.info(
                             "Project diff: +%d/-%d/~%d clips",
                             diff.clips_added, diff.clips_removed, diff.clips_modified,
                         )
 
                 prev_snapshot = snapshot
+                self._latest_project_snapshot = snapshot
 
             time.sleep(2.0)
 
@@ -251,8 +287,6 @@ class Daemon:
             time.sleep(2.0)
 
     def _generate_manifest(self, export_path: Path) -> None:
-        import hashlib
-
         digest = hashlib.sha256()
         with export_path.open("rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -274,12 +308,16 @@ class Daemon:
 
         first_hash_ms = 0
         last_hash_ms = 0
+        last_window_hash = ""
         chain_root = ""
         chain_length = 0
         stem_sr = 0
         stem_ch = 0
 
-        for event in self._session_events:
+        with self._session_lock:
+            events_snapshot = list(self._session_events)
+
+        for event in events_snapshot:
             et = event.get("event_type")
             if et == "buffer_hash":
                 chain_length += 1
@@ -288,6 +326,7 @@ class Daemon:
                     first_hash_ms = ts
                     chain_root = str(event.get("prev_hash", "genesis"))
                 last_hash_ms = ts
+                last_window_hash = str(event.get("window_hash", ""))
                 stem_sr = int(event.get("sample_rate_hz", stem_sr))
                 stem_ch = int(event.get("channel_count", stem_ch))
             elif et == "sample_file_observed":
@@ -314,8 +353,71 @@ class Daemon:
                 proof_level="directly_observed",
             ))
 
+        all_layers = {"audio_buffer", "transport", "midi", "session",
+                      "sample_watcher", "project_differ", "input_capture",
+                      "screen_observer"}
+        missing_layers = sorted(all_layers - self._active_layers)
+        builder.unobserved = list(builder.unobserved)
+        for layer in missing_layers:
+            builder.unobserved.append(f"layer_{layer}_not_active")
+
+        evidence_hashes: dict[str, str] = {}
+        for evidence_file in self.evidence_dir.glob("*.jsonl"):
+            h = hashlib.sha256()
+            h.update(evidence_file.read_bytes())
+            evidence_hashes[evidence_file.name] = h.hexdigest()
+
+        manifest = builder.build()
+
+        snap = self._latest_project_snapshot
+        if snap is not None:
+            manifest["session_facts"] = {
+                "bpm": snap.transport_bpm,
+                "loop_on": snap.transport_loop_on,
+                "track_count": snap.track_count,
+                "clip_count": snap.clip_count,
+                "sample_refs": sorted(snap.sample_refs),
+                "tracks": [
+                    {
+                        "name": t.name,
+                        "type": t.track_type,
+                        "devices": list(t.devices),
+                        "sample_paths": list(t.sample_paths),
+                        "clip_count": t.clip_count,
+                        "midi_note_count": t.midi_note_count,
+                        "automation_point_count": t.automation_point_count,
+                        "routing_input": t.routing_input,
+                        "routing_output": t.routing_output,
+                        "group_id": t.group_id,
+                    }
+                    for t in snap.tracks
+                ],
+            }
+        manifest["evidence_binding"] = {
+            "evidence_file_hashes": evidence_hashes,
+            "last_window_hash": last_window_hash,
+            "chain_length": chain_length,
+        }
+
+        try:
+            identity = self._hw_provider.device_identity()
+            manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            signature = self._hw_provider.sign(manifest_bytes)
+            manifest["manifest_signature"] = {
+                "algorithm": identity.algorithm,
+                "device_id": identity.device_id,
+                "public_key_hex": identity.public_key_hex,
+                "signature_hex": signature.hex(),
+                "signed_content_hash": hashlib.sha256(manifest_bytes).hexdigest(),
+            }
+        except Exception:
+            log.warning("Could not sign manifest (hardware provider unavailable)")
+
         manifest_path = self.manifest_dir / f"{export_path.stem}_manifest.json"
-        builder.write_json(manifest_path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+            f.write("\n")
         log.info("Manifest written: %s", manifest_path)
 
     @staticmethod

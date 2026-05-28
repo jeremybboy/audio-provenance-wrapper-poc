@@ -302,10 +302,195 @@ def _summarize_events(candidate: CorrelationCandidate) -> list[dict[str, object]
     ]
 
 
+class ParameterAdjustRule(CorrelationRule):
+    """Detect knob/fader adjustment: parameter_change + spectral_profile_change."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_param = any(
+            e.layer == "midi"
+            and e.event_type == "parameter_change"
+            for e in candidate.events
+        )
+        has_profile = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "spectral_profile_change"
+            for e in candidate.events
+        )
+        if not (has_param and has_profile):
+            return None
+
+        param_event = next(
+            (e for e in candidate.events if e.event_type == "parameter_change"), None
+        )
+        cc = param_event.data.get("cc_number", "?") if param_event else "?"
+
+        confidence = 0.80
+        confidence += _alignment_bonus(candidate)
+        confidence += _layer_bonus(candidate, required=2)
+
+        return CompositeEdit(
+            edit_type="effect_adjusted",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+            notes=[f"CC#{cc} change correlated with spectral profile shift"],
+        )
+
+
+class RecordingStartRule(CorrelationRule):
+    """Detect recording: transport_change(playing/recording) + audio_transition."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_transport_play = any(
+            e.layer == "transport"
+            and e.event_type == "transport_change"
+            and e.data.get("transport_state") in ("playing", "recording")
+            for e in candidate.events
+        )
+        has_audio_start = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "audio_transition"
+            and e.data.get("direction") == "silence_to_audio"
+            for e in candidate.events
+        )
+        if not (has_transport_play and has_audio_start):
+            return None
+
+        is_recording = any(
+            e.data.get("transport_state") == "recording"
+            for e in candidate.events
+            if e.event_type == "transport_change"
+        )
+        edit_type = "recording_started" if is_recording else "playback_started"
+
+        confidence = 0.85
+        confidence += _alignment_bonus(candidate)
+
+        return CompositeEdit(
+            edit_type=edit_type,
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+        )
+
+
+class ContentChangeRule(CorrelationRule):
+    """Detect content change: spectral_shift + audio continues (no silence)."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        has_spectral_shift = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "spectral_shift"
+            for e in candidate.events
+        )
+        has_transition = any(
+            e.layer == "audio_buffer"
+            and e.event_type == "audio_transition"
+            for e in candidate.events
+        )
+        if not has_spectral_shift or has_transition:
+            return None
+
+        has_profile_change = any(
+            e.event_type == "spectral_profile_change"
+            for e in candidate.events
+        )
+
+        confidence = 0.55
+        if has_profile_change:
+            confidence += 0.10
+        confidence += _layer_bonus(candidate, required=1)
+
+        return CompositeEdit(
+            edit_type="content_changed",
+            confidence=min(confidence, 1.0),
+            timestamp_ms=candidate.window_center_ms,
+            contributing_events=_summarize_events(candidate),
+        )
+
+
+class DeviceAddedRule(CorrelationRule):
+    """Detect plugin/device added: project_diff with devices_changed."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        for e in candidate.events:
+            if e.layer != "project_differ" or e.event_type != "project_diff":
+                continue
+            devices = e.data.get("devices_changed", [])
+            if not devices:
+                continue
+
+            confidence = 0.70
+            confidence += _layer_bonus(candidate, required=1)
+
+            return CompositeEdit(
+                edit_type="device_chain_changed",
+                confidence=min(confidence, 1.0),
+                timestamp_ms=candidate.window_center_ms,
+                contributing_events=_summarize_events(candidate),
+                notes=[f"Devices changed on: {', '.join(str(d) for d in devices[:5])}"],
+            )
+        return None
+
+
+class AutomationEditRule(CorrelationRule):
+    """Detect automation editing: project_diff with automation_points_delta."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        for e in candidate.events:
+            if e.layer != "project_differ" or e.event_type != "project_diff":
+                continue
+            delta = e.data.get("automation_points_delta", 0)
+            if delta == 0:
+                continue
+
+            confidence = 0.65
+            confidence += _layer_bonus(candidate, required=1)
+
+            return CompositeEdit(
+                edit_type="automation_edited",
+                confidence=min(confidence, 1.0),
+                timestamp_ms=candidate.window_center_ms,
+                contributing_events=_summarize_events(candidate),
+                notes=[f"Automation points delta: {delta:+d}"],
+            )
+        return None
+
+
+class MidiEditRule(CorrelationRule):
+    """Detect MIDI editing: project_diff with midi_notes_delta."""
+
+    def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
+        for e in candidate.events:
+            if e.layer != "project_differ" or e.event_type != "project_diff":
+                continue
+            delta = e.data.get("midi_notes_delta", 0)
+            if delta == 0:
+                continue
+
+            confidence = 0.65
+            confidence += _layer_bonus(candidate, required=1)
+
+            return CompositeEdit(
+                edit_type="midi_edited",
+                confidence=min(confidence, 1.0),
+                timestamp_ms=candidate.window_center_ms,
+                contributing_events=_summarize_events(candidate),
+                notes=[f"MIDI notes delta: {delta:+d}"],
+            )
+        return None
+
+
 DEFAULT_RULES: list[CorrelationRule] = [
     ClipPasteRule(),
     ClipDeleteRule(),
     EffectChangeRule(),
+    ParameterAdjustRule(),
+    RecordingStartRule(),
+    ContentChangeRule(),
+    DeviceAddedRule(),
+    AutomationEditRule(),
+    MidiEditRule(),
     SampleImportRule(),
     UndoRule(),
     ArrangementEditRule(),

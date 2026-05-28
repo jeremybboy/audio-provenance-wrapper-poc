@@ -255,7 +255,18 @@ class VerifyTests(unittest.TestCase):
         ))
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "m.json"
-            builder.write_json(p)
+            manifest = builder.build()
+            manifest["evidence_binding"] = {"evidence_file_hashes": {}, "last_window_hash": "abc", "chain_length": 10}
+            manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            import hashlib as _hl
+            manifest["manifest_signature"] = {
+                "algorithm": "hmac-sha256",
+                "device_id": "test",
+                "public_key_hex": "test",
+                "signature_hex": "test",
+                "signed_content_hash": _hl.sha256(manifest_bytes).hexdigest(),
+            }
+            p.write_text(json.dumps(manifest, indent=2))
             errors = verify_manifest(p)
             self.assertEqual(errors, [])
 

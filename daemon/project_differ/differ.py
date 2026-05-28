@@ -13,6 +13,22 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class TrackInfo:
+    """Rich per-track metadata extracted from the .als XML."""
+
+    name: str
+    track_type: str
+    devices: tuple[str, ...]
+    sample_paths: tuple[str, ...]
+    clip_count: int
+    automation_point_count: int
+    midi_note_count: int
+    group_id: str
+    routing_input: str
+    routing_output: str
+
+
+@dataclass(frozen=True)
 class ProjectSnapshot:
     """Structural fingerprint of an Ableton .als project at a point in time."""
 
@@ -20,6 +36,7 @@ class ProjectSnapshot:
     file_size_bytes: int
     track_count: int
     track_names: tuple[str, ...]
+    tracks: tuple[TrackInfo, ...]
     clip_count: int
     clip_hashes: frozenset[str]
     device_chain_hashes: frozenset[str]
@@ -108,6 +125,8 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
     automation_count = 0
     midi_note_count = 0
 
+    track_infos: list[TrackInfo] = []
+
     if tracks_el is not None:
         for track in tracks_el:
             name_el = track.find("Name")
@@ -118,27 +137,79 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
                     name_val = eff.get("Value", "")
             track_names.append(name_val)
 
+            track_type = track.tag
+            track_clips = 0
+            track_auto = 0
+            track_midi = 0
+            track_devices: list[str] = []
+            track_samples: list[str] = []
+
             for clip_slot in track.iter("ClipSlot"):
                 clip_count += 1
-                clip_id = clip_slot.get("Id", "")
+                track_clips += 1
                 clip_hashes.add(hashlib.sha256(ET.tostring(clip_slot)).hexdigest()[:16])
 
             for device_chain in track.iter("DeviceChain"):
                 device_hashes.add(hashlib.sha256(ET.tostring(device_chain)).hexdigest()[:16])
+                devices_el = device_chain.find(".//Devices")
+                if devices_el is not None:
+                    for device in devices_el:
+                        dev_name = device.tag
+                        user_name_el = device.find(".//UserName")
+                        if user_name_el is not None and user_name_el.get("Value"):
+                            dev_name = user_name_el.get("Value", dev_name)
+                        track_devices.append(dev_name)
 
             for file_ref in track.iter("FileRef"):
                 rel = file_ref.find("RelativePath")
                 if rel is not None:
-                    sample_refs.add(rel.get("Value", ""))
+                    val = rel.get("Value", "")
+                    if val:
+                        sample_refs.add(val)
+                        track_samples.append(val)
                 abs_el = file_ref.find("Path")
                 if abs_el is not None:
-                    sample_refs.add(abs_el.get("Value", ""))
+                    val = abs_el.get("Value", "")
+                    if val:
+                        sample_refs.add(val)
+                        if val not in track_samples:
+                            track_samples.append(val)
 
             for notes_el in track.iter("Notes"):
                 for key_track in notes_el.iter("KeyTrack"):
-                    midi_note_count += sum(1 for _ in key_track.iter("MidiNoteEvent"))
+                    c = sum(1 for _ in key_track.iter("MidiNoteEvent"))
+                    midi_note_count += c
+                    track_midi += c
 
-            automation_count += sum(1 for _ in track.iter("AutomationPoint"))
+            track_auto = sum(1 for _ in track.iter("AutomationPoint"))
+            automation_count += track_auto
+
+            group_id = ""
+            group_el = track.find("TrackGroupId")
+            if group_el is not None:
+                group_id = group_el.get("Value", "")
+
+            routing_in = ""
+            routing_out = ""
+            input_routing = track.find(".//AudioInputRouting/Target")
+            if input_routing is not None:
+                routing_in = input_routing.get("Value", "")
+            output_routing = track.find(".//AudioOutputRouting/Target")
+            if output_routing is not None:
+                routing_out = output_routing.get("Value", "")
+
+            track_infos.append(TrackInfo(
+                name=name_val,
+                track_type=track_type,
+                devices=tuple(track_devices),
+                sample_paths=tuple(track_samples),
+                clip_count=track_clips,
+                automation_point_count=track_auto,
+                midi_note_count=track_midi,
+                group_id=group_id,
+                routing_input=routing_in,
+                routing_output=routing_out,
+            ))
 
     transport = live_set.find("Transport")
     bpm = 120.0
@@ -168,6 +239,7 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
         file_size_bytes=stat.st_size,
         track_count=len(track_names),
         track_names=tuple(track_names),
+        tracks=tuple(track_infos),
         clip_count=clip_count,
         clip_hashes=frozenset(clip_hashes),
         device_chain_hashes=frozenset(device_hashes),

@@ -13,6 +13,7 @@ def _make_snapshot(**overrides) -> ProjectSnapshot:
         file_size_bytes=1000,
         track_count=2,
         track_names=("Track 1", "Track 2"),
+        tracks=(),
         clip_count=4,
         clip_hashes=frozenset({"c1", "c2", "c3", "c4"}),
         device_chain_hashes=frozenset({"d1", "d2"}),

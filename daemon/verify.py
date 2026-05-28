@@ -48,6 +48,21 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     if "apw.unobserved" not in labels:
         errors.append("C2PA assertions missing apw.unobserved declaration")
 
+    if "evidence_binding" not in data:
+        errors.append("No evidence_binding (cannot trace manifest to evidence files)")
+
+    sig = data.get("manifest_signature")
+    if sig is None:
+        errors.append("Manifest is unsigned (no manifest_signature)")
+    elif sig.get("signed_content_hash"):
+        import hashlib
+        manifest_copy = {k: v for k, v in data.items() if k != "manifest_signature"}
+        recomputed = hashlib.sha256(
+            json.dumps(manifest_copy, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if recomputed != sig["signed_content_hash"]:
+            errors.append("Manifest content hash mismatch (manifest may have been tampered with)")
+
     return errors
 
 
