@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from daemon.common import append_jsonl
+
 log = logging.getLogger(__name__)
 
 
@@ -73,7 +75,12 @@ class CorrelationRule:
 
 
 class ClipPasteRule(CorrelationRule):
-    """Detect clip paste: Cmd+V followed by silence-to-audio transition."""
+    """Detect clip paste: Cmd+V followed by silence-to-audio transition.
+
+    TODO: Cannot fire until daemon/input_capture/ CGEventTap is implemented.
+    Requires input_capture layer to emit input_shortcut events with
+    probable_operation="paste". See docs/MULTI_LAYER_OBSERVATION.md Phase 2.
+    """
 
     def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
         has_paste_shortcut = any(
@@ -103,7 +110,10 @@ class ClipPasteRule(CorrelationRule):
 
 
 class ClipDeleteRule(CorrelationRule):
-    """Detect clip delete: Delete key followed by audio-to-silence transition."""
+    """Detect clip delete: Delete key followed by audio-to-silence transition.
+
+    TODO: Cannot fire until daemon/input_capture/ CGEventTap is implemented.
+    """
 
     def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
         has_delete = any(
@@ -133,7 +143,10 @@ class ClipDeleteRule(CorrelationRule):
 
 
 class EffectChangeRule(CorrelationRule):
-    """Detect effect change: mixer visual change + spectral shift, no silence transition."""
+    """Detect effect change: mixer visual change + spectral shift, no silence transition.
+
+    TODO: Cannot fire until daemon/screen_observer/ capture is implemented.
+    """
 
     def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
         has_mixer_change = any(
@@ -207,7 +220,12 @@ class SampleImportRule(CorrelationRule):
 
 
 class UndoRule(CorrelationRule):
-    """Detect undo: Cmd+Z followed by content hash matching an earlier window."""
+    """Detect undo: Cmd+Z followed by content hash matching an earlier window.
+
+    TODO: Cannot fire until daemon/input_capture/ CGEventTap is implemented.
+    TODO: Hash chain rollback detection (matching current hash to earlier window)
+    not yet implemented; would increase confidence significantly.
+    """
 
     def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
         has_undo = any(
@@ -231,7 +249,11 @@ class UndoRule(CorrelationRule):
 
 
 class ArrangementEditRule(CorrelationRule):
-    """Detect arrangement edit: project diff + screen change + input activity."""
+    """Detect arrangement edit: project diff + screen change + input activity.
+
+    TODO: screen_observer and input_capture layers boost confidence but are
+    not required. This rule fires with project_differ alone at base confidence.
+    """
 
     def evaluate(self, candidate: CorrelationCandidate) -> CompositeEdit | None:
         has_project_diff = any(
@@ -547,10 +569,7 @@ class CorrelationEngine:
         return results
 
     def _write_event(self, composite: CompositeEdit) -> None:
-        self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.evidence_path.open("a", encoding="utf-8") as f:
-            json.dump(composite.to_event_dict(), f, separators=(",", ":"))
-            f.write("\n")
+        append_jsonl(self.evidence_path, composite.to_event_dict())
 
     @property
     def emitted_count(self) -> int:

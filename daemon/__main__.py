@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+from daemon.common import append_jsonl, sha256_file
 from daemon.correlation_engine.engine import CorrelationEngine, LayerEvent
 from daemon.evidence_receiver.receiver import EvidenceReceiver
 from daemon.hardware_attestation.provider import SoftwareProvider, detect_provider
@@ -90,6 +91,7 @@ class Daemon:
         try:
             self._hw_provider = detect_provider()
         except Exception:
+            log.warning("Hardware provider detection failed; using software fallback", exc_info=True)
             self._hw_provider = SoftwareProvider(
                 key_path=Path("~/.apw/device_key.bin")
             )
@@ -287,11 +289,7 @@ class Daemon:
             time.sleep(2.0)
 
     def _generate_manifest(self, export_path: Path) -> None:
-        digest = hashlib.sha256()
-        with export_path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                digest.update(chunk)
-
+        export_hash = sha256_file(export_path)
         stat = export_path.stat()
         builder = ManifestBuilder(
             session_id=f"session-{int(time.time())}",
@@ -299,7 +297,7 @@ class Daemon:
         builder.set_export(ExportEvidence(
             file_path=str(export_path),
             file_name=export_path.name,
-            sha256=digest.hexdigest(),
+            sha256=export_hash,
             format=export_path.suffix.lower().lstrip("."),
             file_size_bytes=stat.st_size,
             duration_seconds=None,
@@ -411,7 +409,7 @@ class Daemon:
                 "signed_content_hash": hashlib.sha256(manifest_bytes).hexdigest(),
             }
         except Exception:
-            log.warning("Could not sign manifest (hardware provider unavailable)")
+            log.warning("Could not sign manifest", exc_info=True)
 
         manifest_path = self.manifest_dir / f"{export_path.stem}_manifest.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -438,10 +436,7 @@ class Daemon:
         return prev_size > 0
 
     def _write_evidence(self, filename: str, event: dict[str, object]) -> None:
-        path = self.evidence_dir / filename
-        with path.open("a", encoding="utf-8") as f:
-            json.dump(event, f, separators=(",", ":"))
-            f.write("\n")
+        append_jsonl(self.evidence_dir / filename, event)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

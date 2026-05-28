@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import math
@@ -11,9 +10,10 @@ import subprocess
 import time
 import warnings
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from daemon.common import append_jsonl, sha256_file, utc_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -32,12 +32,6 @@ class FileSignature:
     modified_ns: int
 
 
-def utc_timestamp(timestamp: float | None = None) -> str:
-    if timestamp is None:
-        timestamp = time.time()
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def is_audio_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
 
@@ -52,14 +46,6 @@ def iter_audio_files(watch_dir: Path, recursive: bool) -> Iterable[Path]:
 def file_signature(path: Path) -> FileSignature:
     stat_result = path.stat()
     return FileSignature(size_bytes=stat_result.st_size, modified_ns=stat_result.st_mtime_ns)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as audio_file:
-        for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def empty_audio_metadata() -> dict[str, float | int | None]:
@@ -186,6 +172,7 @@ def compute_audio_fingerprint(path: Path) -> dict[str, float | None]:
 
             return {"rms": round(rms, 6), "zero_crossing_rate": round(zcr, 6)}
     except Exception:
+        log.debug("Audio fingerprint extraction failed for %s", path, exc_info=True)
         return {"rms": None, "zero_crossing_rate": None}
 
 
@@ -213,11 +200,7 @@ def build_sample_file_event(path: Path, observed_at: str | None = None) -> dict[
 
 
 def append_event(event: dict[str, object], evidence_path: Path) -> None:
-    resolved_path = evidence_path.expanduser()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    with resolved_path.open("a", encoding="utf-8") as evidence_file:
-        json.dump(event, evidence_file, separators=(",", ":"))
-        evidence_file.write("\n")
+    append_jsonl(evidence_path.expanduser(), event)
 
 
 class SampleWatcher:

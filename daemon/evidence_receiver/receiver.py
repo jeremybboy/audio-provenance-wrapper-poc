@@ -4,16 +4,12 @@ import argparse
 import json
 import logging
 import socket
-from datetime import datetime, timezone
 from pathlib import Path
 
+from daemon.common import append_jsonl, utc_timestamp
 from .taxonomy import validate_event
 
 log = logging.getLogger(__name__)
-
-
-def utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class EvidenceReceiver:
@@ -48,10 +44,7 @@ class EvidenceReceiver:
         return event
 
     def _write_event(self, event: dict[str, object]) -> None:
-        self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.evidence_path.open("a", encoding="utf-8") as f:
-            json.dump(event, f, separators=(",", ":"))
-            f.write("\n")
+        append_jsonl(self.evidence_path, event)
 
     def run_forever(self) -> None:
         self.evidence_path.parent.mkdir(parents=True, exist_ok=True)

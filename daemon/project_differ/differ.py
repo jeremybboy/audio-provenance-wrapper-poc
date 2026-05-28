@@ -9,6 +9,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from daemon.common import sha256_file
+
 log = logging.getLogger(__name__)
 
 
@@ -86,14 +88,6 @@ class ProjectDiff:
             or self.loop_changed
             or self.locators_delta != 0
         )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def parse_als(path: Path) -> ET.Element:

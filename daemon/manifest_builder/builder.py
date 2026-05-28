@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
+from daemon.common import utc_timestamp
+
 log = logging.getLogger(__name__)
-
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -79,7 +74,7 @@ class ManifestBuilder:
     """
 
     session_id: str = ""
-    created_at: str = field(default_factory=_utc_iso)
+    created_at: str = field(default_factory=utc_timestamp)
     stems: list[StemEvidence] = field(default_factory=list)
     export: ExportEvidence | None = None
     ingredients: list[IngredientEvidence] = field(default_factory=list)
