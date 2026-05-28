@@ -193,8 +193,24 @@ void AudioObserver::processWindow (const float* data, int numSamples)
     auto windowHash = computeChainedHash (data, numSamples);
     auto prevHash   = previousHash.isEmpty() ? juce::String ("genesis") : previousHash;
 
+    // ── Silence throttling ──
+    // Always hash (chain integrity) but only emit UDP events at full rate
+    // when audio is present.  During sustained silence, emit once every
+    // kSilenceEmitInterval windows (~1 s) to avoid flooding the daemon.
+    bool shouldEmit = true;
+    if (! hasAudio)
+    {
+        ++consecutiveSilentWindows;
+        shouldEmit = (consecutiveSilentWindows == 1)
+                  || (consecutiveSilentWindows % kSilenceEmitInterval == 0);
+    }
+    else
+    {
+        consecutiveSilentWindows = 0;
+    }
+
     // ── buffer_hash event ──
-    if (eventCallback)
+    if (eventCallback && shouldEmit)
     {
         auto json = buildJsonEvent (EventTypes::bufferHash, timestampMs, samplePos,
         {
@@ -206,7 +222,10 @@ void AudioObserver::processWindow (const float* data, int numSamples)
             { "channel_count",        channels },
             { "sample_rate_hz",       sampleRate },
             { "window_size_samples",  numSamples },
-            { "bpm",                  bpmX100 / 100.0 }
+            { "bpm",                  bpmX100 / 100.0 },
+            { "silent_windows_skipped", consecutiveSilentWindows > 1
+                                        ? juce::var (consecutiveSilentWindows - 1)
+                                        : juce::var (0) }
         });
         eventCallback (json);
         totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
