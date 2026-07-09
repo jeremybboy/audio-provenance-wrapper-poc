@@ -40,7 +40,13 @@ AudioProvenanceCaptureAudioProcessorEditor::AudioProvenanceCaptureAudioProcessor
     configureObservationLabel (lastBufferSeenLabel, 15.0f);
     addAndMakeVisible (lastBufferSeenLabel);
 
-    scopeLabel.setText ("No hashing, UDP, C2PA, or wrapper-host logic in this build.", juce::dontSendNotification);
+    configureObservationLabel (hashChainLabel, 15.0f);
+    addAndMakeVisible (hashChainLabel);
+
+    configureObservationLabel (lastHashLabel, 13.0f);
+    addAndMakeVisible (lastHashLabel);
+
+    scopeLabel.setText ("No C2PA or wrapper-host logic in this build.", juce::dontSendNotification);
     scopeLabel.setJustificationType (juce::Justification::centredLeft);
     scopeLabel.setFont (juce::FontOptions (13.0f));
     addAndMakeVisible (scopeLabel);
@@ -48,7 +54,7 @@ AudioProvenanceCaptureAudioProcessorEditor::AudioProvenanceCaptureAudioProcessor
     updateObservationLabels();
     startTimerHz (4);
 
-    setSize (440, 250);
+    setSize (480, 330);
 }
 
 void AudioProvenanceCaptureAudioProcessorEditor::paint (juce::Graphics& g)
@@ -68,6 +74,9 @@ void AudioProvenanceCaptureAudioProcessorEditor::resized()
     sampleRateLabel.setBounds (bounds.removeFromTop (24));
     bufferSizeLabel.setBounds (bounds.removeFromTop (24));
     lastBufferSeenLabel.setBounds (bounds.removeFromTop (24));
+    bounds.removeFromTop (8);
+    hashChainLabel.setBounds (bounds.removeFromTop (24));
+    lastHashLabel.setBounds (bounds.removeFromTop (24));
     bounds.removeFromTop (8);
     scopeLabel.setBounds (bounds.removeFromTop (28));
 }
@@ -104,4 +113,21 @@ void AudioProvenanceCaptureAudioProcessorEditor::updateObservationLabels()
                              juce::dontSendNotification);
     lastBufferSeenLabel.setText (juce::String ("Last buffer seen: ") + lastRenderedBufferSeenText,
                                  juce::dontSendNotification);
+
+    // Granular observation stats.
+    auto& observer = audioProcessor.getAudioObserver();
+    const auto windowsHashed = observer.getTotalWindowsHashed();
+    const auto eventsEmitted = observer.getTotalEventsEmitted();
+
+    hashChainLabel.setText (juce::String ("Hash chain: ")
+                            + juce::String (windowsHashed) + " windows, "
+                            + juce::String (eventsEmitted) + " events streamed",
+                            juce::dontSendNotification);
+
+    auto lastHash = observer.getLastHash();
+    if (lastHash.isNotEmpty())
+        lastHashLabel.setText (juce::String ("Last hash: ") + lastHash.substring (0, 16) + "...",
+                               juce::dontSendNotification);
+    else
+        lastHashLabel.setText ("Last hash: (none)", juce::dontSendNotification);
 }

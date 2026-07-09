@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import logging
+import math
 import re
+import struct
 import subprocess
-import sys
 import time
 import warnings
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from daemon.common import append_jsonl, sha256_file, utc_timestamp
+
+log = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif", ".mp3", ".m4a"}
 DEFAULT_EVIDENCE_PATH = Path("evidence/sample_import_events.jsonl")
@@ -28,12 +32,6 @@ class FileSignature:
     modified_ns: int
 
 
-def utc_timestamp(timestamp: float | None = None) -> str:
-    if timestamp is None:
-        timestamp = time.time()
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def is_audio_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
 
@@ -48,14 +46,6 @@ def iter_audio_files(watch_dir: Path, recursive: bool) -> Iterable[Path]:
 def file_signature(path: Path) -> FileSignature:
     stat_result = path.stat()
     return FileSignature(size_bytes=stat_result.st_size, modified_ns=stat_result.st_mtime_ns)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as audio_file:
-        for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def empty_audio_metadata() -> dict[str, float | int | None]:
@@ -143,6 +133,49 @@ def _extract_afinfo_metadata(path: Path) -> dict[str, float | int | None]:
     return metadata
 
 
+def compute_audio_fingerprint(path: Path) -> dict[str, float | None]:
+    if path.suffix.lower() != ".wav":
+        return {"rms": None, "zero_crossing_rate": None}
+
+    try:
+        import wave
+
+        with wave.open(str(path), "rb") as wf:
+            nframes = wf.getnframes()
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            if sampwidth != 2 or nframes == 0:
+                return {"rms": None, "zero_crossing_rate": None}
+
+            max_frames = min(nframes, 44100)
+            raw = wf.readframes(max_frames)
+            total_samples = len(raw) // 2
+            samples = struct.unpack(f"<{total_samples}h", raw)
+
+            if nchannels > 1:
+                mono = [
+                    sum(samples[i : i + nchannels]) / nchannels
+                    for i in range(0, len(samples), nchannels)
+                ]
+            else:
+                mono = list(samples)
+
+            if not mono:
+                return {"rms": None, "zero_crossing_rate": None}
+
+            norm = [s / 32768.0 for s in mono]
+            rms = math.sqrt(sum(s * s for s in norm) / len(norm))
+            crossings = sum(
+                1 for i in range(1, len(norm)) if (norm[i] >= 0) != (norm[i - 1] >= 0)
+            )
+            zcr = crossings / (len(norm) - 1) if len(norm) > 1 else 0.0
+
+            return {"rms": round(rms, 6), "zero_crossing_rate": round(zcr, 6)}
+    except Exception:
+        log.debug("Audio fingerprint extraction failed for %s", path, exc_info=True)
+        return {"rms": None, "zero_crossing_rate": None}
+
+
 def build_sample_file_event(path: Path, observed_at: str | None = None) -> dict[str, object]:
     resolved_path = path.expanduser().resolve()
     stat_result = resolved_path.stat()
@@ -161,16 +194,13 @@ def build_sample_file_event(path: Path, observed_at: str | None = None) -> dict[
         "modified_at": utc_timestamp(stat_result.st_mtime),
         "observed_at": observed_at or utc_timestamp(),
         "audio_metadata": extract_audio_metadata(resolved_path),
+        "audio_fingerprint": compute_audio_fingerprint(resolved_path),
         "notes": list(DEFAULT_NOTES),
     }
 
 
 def append_event(event: dict[str, object], evidence_path: Path) -> None:
-    resolved_path = evidence_path.expanduser()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    with resolved_path.open("a", encoding="utf-8") as evidence_file:
-        json.dump(event, evidence_file, separators=(",", ":"))
-        evidence_file.write("\n")
+    append_jsonl(evidence_path.expanduser(), event)
 
 
 class SampleWatcher:
@@ -234,13 +264,10 @@ class SampleWatcher:
         else:
             self.mark_existing_seen()
 
-        print(
-            f"Watching {self.watch_dir} for audio samples; writing {self.evidence_path}",
-            file=sys.stderr,
-        )
+        log.info("Watching %s for audio samples; writing %s", self.watch_dir, self.evidence_path)
         while True:
             for event in self.scan_once():
-                print(json.dumps(event, separators=(",", ":")), flush=True)
+                log.info("%s", json.dumps(event, separators=(",", ":")))
             time.sleep(self.poll_interval_seconds)
 
 
@@ -303,11 +330,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    args = parse_args(argv or [])
 
     if args.once:
         for event in observe_existing_files(args.watch_dir, args.evidence_file, args.recursive):
-            print(json.dumps(event, separators=(",", ":")))
+            log.info("%s", json.dumps(event, separators=(",", ":")))
         return 0
 
     watcher = SampleWatcher(

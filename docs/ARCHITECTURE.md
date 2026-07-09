@@ -28,10 +28,11 @@ Everything else must remain:
 ```mermaid
 flowchart LR
     A[Ableton Live] --> B[Capture Plugin]
-    B --> C[Local Daemon]
+    B -->|UDP events| C[Local Daemon]
     A --> D[Exported WAV or AIFF]
     C --> E[JSON Manifest]
     D --> E
+    F[Sample Folder] -->|Filesystem watch| C
 ```
 
 ## System Components
@@ -57,6 +58,27 @@ Responsibilities:
 
 The plugin is the trust boundary for observable provenance.
 
+### Granular Observation Pipeline
+
+The plugin runs a background observation thread that consumes audio from a
+lock-free ring buffer and produces the following per-window evidence:
+
+1. **Rolling SHA-256 hash chain** -- each window hash includes the previous
+   hash, creating a tamper-evident sequence.
+2. **RMS level** -- energy measure used for silence detection and correlation.
+3. **Zero-crossing rate** -- simple spectral proxy for correlation.
+4. **Spectral centroid** -- FFT-derived frequency centre of mass; shifts above
+   a threshold emit dedicated events.
+5. **Silence/audio transition events** -- emitted when the window crosses the
+   silence threshold in either direction.
+6. **Transport state tracking** -- play/stop/record/loop/BPM changes observed
+   via the JUCE play head.
+7. **MIDI event capture** -- note on/off, CC, program change events forwarded
+   through the plugin.
+
+All events are serialized as single-line JSON and streamed to the daemon over
+UDP (default port 9876).
+
 ## Local Daemon
 
 A macOS background process.
@@ -72,6 +94,32 @@ Responsibilities:
 - hash observed sample files
 - generate internal provenance records
 - serialize minimal C2PA-compatible manifests
+
+### Evidence Receiver
+
+Listens for UDP packets from the plugin, validates each event against the
+taxonomy, timestamps receipt, and appends to a JSONL evidence file.
+
+### Sample Correlation
+
+When the sample watcher detects a new audio file it computes an audio
+fingerprint (RMS + zero-crossing rate from the first second of PCM).  The
+correlator compares incoming stream features against registered sample
+fingerprints.  Matches produce ``ingredient_correlation`` events with proof
+level ``inferred``.
+
+## Event Taxonomy
+
+| Event Type              | Proof Level        | Source    |
+|-------------------------|--------------------|-----------|
+| `buffer_hash`           | directly_observed  | plugin    |
+| `audio_transition`      | directly_observed  | plugin    |
+| `spectral_shift`        | directly_observed  | plugin    |
+| `transport_change`      | directly_observed  | plugin    |
+| `midi_event`            | directly_observed  | plugin    |
+| `session_config_change` | directly_observed  | plugin    |
+| `sample_file_observed`  | directly_observed  | daemon    |
+| `ingredient_correlation`| inferred           | daemon    |
 
 ## Internal Provenance Record
 

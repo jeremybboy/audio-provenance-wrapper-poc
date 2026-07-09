@@ -2,6 +2,9 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include "AudioObserver.h"
+#include "EventEmitter.h"
+
 #include <atomic>
 #include <cstdint>
 
@@ -19,7 +22,7 @@ public:
     };
 
     AudioProvenanceCaptureAudioProcessor();
-    ~AudioProvenanceCaptureAudioProcessor() override = default;
+    ~AudioProvenanceCaptureAudioProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -48,6 +51,9 @@ public:
 
     AudioBufferObservationSnapshot getAudioBufferObservationSnapshot() const noexcept;
 
+    // Granular observation stats for the UI.
+    apw::AudioObserver& getAudioObserver() noexcept { return audioObserver; }
+
 private:
     template <typename SampleType>
     void passThrough (juce::AudioBuffer<SampleType>& buffer);
@@ -61,6 +67,13 @@ private:
     std::atomic<std::uint64_t> lastBufferSeenMilliseconds { 0 };
     std::atomic<std::uint64_t> lastNonSilentBufferSeenMilliseconds { 0 };
     std::atomic<bool> lastBufferHadAudio { false };
+
+    // Granular observation pipeline (emitter must outlive observer).
+    apw::EventEmitter eventEmitter;
+    apw::AudioObserver audioObserver;
+
+    // Pre-allocated buffer for double-to-float conversion.
+    juce::AudioBuffer<float> doubleConversionBuffer;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioProvenanceCaptureAudioProcessor)
 };

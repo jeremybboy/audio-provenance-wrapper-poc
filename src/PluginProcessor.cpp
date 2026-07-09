@@ -18,6 +18,15 @@ AudioProvenanceCaptureAudioProcessor::AudioProvenanceCaptureAudioProcessor()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
+    audioObserver.start ([this] (const juce::String& jsonEvent)
+    {
+        eventEmitter.sendEvent (jsonEvent);
+    });
+}
+
+AudioProvenanceCaptureAudioProcessor::~AudioProvenanceCaptureAudioProcessor()
+{
+    audioObserver.stop();
 }
 
 void AudioProvenanceCaptureAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -28,6 +37,12 @@ void AudioProvenanceCaptureAudioProcessor::prepareToPlay (double sampleRate, int
     lastBufferHadAudio.store (false, std::memory_order_relaxed);
     lastBufferSeenMilliseconds.store (0, std::memory_order_relaxed);
     lastNonSilentBufferSeenMilliseconds.store (0, std::memory_order_relaxed);
+
+    audioObserver.updateSessionConfig (static_cast<int> (std::lround (sampleRate)),
+                                        getTotalNumInputChannels(),
+                                        samplesPerBlock);
+
+    doubleConversionBuffer.setSize (getTotalNumInputChannels(), samplesPerBlock);
 }
 
 void AudioProvenanceCaptureAudioProcessor::releaseResources()
@@ -52,16 +67,43 @@ bool AudioProvenanceCaptureAudioProcessor::isBusesLayoutSupported (const BusesLa
 void AudioProvenanceCaptureAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                                          juce::MidiBuffer& midiMessages)
 {
-    juce::ignoreUnused (midiMessages);
     observeAudioBuffer (buffer);
+
+    // Feed the granular observation pipeline.
+    const int numCh   = buffer.getNumChannels();
+    const int numSamp = buffer.getNumSamples();
+    audioObserver.pushAudioBlock (buffer.getArrayOfReadPointers(), numCh, numSamp);
+    audioObserver.pushMidiMessages (midiMessages);
+    audioObserver.updateTransportState (getPlayHead());
+
     passThrough (buffer);
 }
 
 void AudioProvenanceCaptureAudioProcessor::processBlock (juce::AudioBuffer<double>& buffer,
                                                          juce::MidiBuffer& midiMessages)
 {
-    juce::ignoreUnused (midiMessages);
     observeAudioBuffer (buffer);
+
+    // Convert double buffer to float for the observation pipeline.
+    const int numCh   = buffer.getNumChannels();
+    const int numSamp = buffer.getNumSamples();
+
+    if (doubleConversionBuffer.getNumChannels() < numCh
+        || doubleConversionBuffer.getNumSamples() < numSamp)
+        doubleConversionBuffer.setSize (numCh, numSamp);
+
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        const auto* src = buffer.getReadPointer (ch);
+        auto* dst = doubleConversionBuffer.getWritePointer (ch);
+        for (int i = 0; i < numSamp; ++i)
+            dst[i] = static_cast<float> (src[i]);
+    }
+
+    audioObserver.pushAudioBlock (doubleConversionBuffer.getArrayOfReadPointers(), numCh, numSamp);
+    audioObserver.pushMidiMessages (midiMessages);
+    audioObserver.updateTransportState (getPlayHead());
+
     passThrough (buffer);
 }
 
@@ -136,7 +178,7 @@ const juce::String AudioProvenanceCaptureAudioProcessor::getName() const
 
 bool AudioProvenanceCaptureAudioProcessor::acceptsMidi() const
 {
-    return false;
+    return true;
 }
 
 bool AudioProvenanceCaptureAudioProcessor::producesMidi() const
