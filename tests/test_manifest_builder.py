@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from daemon.schema import validate_manifest_invariants
 from daemon.manifest_builder.builder import (
     ExportEvidence,
     IngredientEvidence,
@@ -16,7 +17,7 @@ class ManifestBuilderTests(unittest.TestCase):
         builder = ManifestBuilder(session_id="test-session")
         manifest = builder.build()
         self.assertEqual(manifest["session_id"], "test-session")
-        self.assertEqual(manifest["apw_version"], "0.2.0")
+        self.assertEqual(manifest["apw_version"], "0.9.0")
         self.assertIn("apw:unobserved", manifest)
         self.assertIn("c2pa_mapping", manifest)
 
@@ -32,10 +33,15 @@ class ManifestBuilderTests(unittest.TestCase):
             channel_count=2,
             source_category="audio_interface_recording",
             proof_level="directly_observed",
+            source_category_proof_level="user_declared",
         ))
         manifest = builder.build()
         self.assertEqual(len(manifest["observed_stems"]), 1)
         self.assertEqual(manifest["observed_stems"][0]["stem_id"], "stem-1")
+        self.assertEqual(
+            manifest["observed_stems"][0]["source"]["apw:proof_level"],
+            "user_declared",
+        )
 
     def test_export_included(self):
         builder = ManifestBuilder(session_id="s1")
@@ -87,6 +93,102 @@ class ManifestBuilderTests(unittest.TestCase):
         builder = ManifestBuilder(session_id="s1")
         manifest = builder.build()
         self.assertIn("hidden_plugin_state", manifest["apw:unobserved"])
+
+    def test_session_cooccurrence_does_not_establish_association(self):
+        builder = ManifestBuilder(session_id="s1")
+        builder.add_stem(StemEvidence(
+            stem_id="stem-1", hash_chain_root="abc123", hash_chain_length=2,
+            first_observed_ms=1000, last_observed_ms=2000, sample_rate_hz=48000,
+            channel_count=2, source_category="unknown", proof_level="directly_observed",
+        ))
+        builder.set_export(ExportEvidence(
+            file_path="/tmp/out.wav", file_name="out.wav", sha256="deadbeef",
+            format="wav", file_size_bytes=100, duration_seconds=1.0,
+            exported_at="2026-05-26T00:00:00Z",
+        ))
+
+        manifest = builder.build()
+
+        association = manifest["stem_export_association"]
+        self.assertEqual(association["status"], "not_established")
+        self.assertEqual(association["apw:proof_level"], "unknown_unobserved")
+        full_provenance = next(
+            claim for claim in manifest["claim_summary"]
+            if claim["claim"] == "full_ableton_provenance"
+        )
+        self.assertFalse(full_provenance["value"])
+        self.assertEqual(full_provenance["apw:proof_level"], "unknown_unobserved")
+
+    def test_host_environment_names_the_host_on_the_fight_card(self):
+        builder = ManifestBuilder(session_id="s1")
+        builder.set_host_environment({
+            "status": "observed",
+            "host_recognised": True,
+            "host_name": "Ableton Live",
+            "host_executable_name": "Live",
+            "wrapper_format": "VST3",
+            "basis": "The plug-in wrapper named the host application that loaded it.",
+            "apw:proof_level": "directly_observed",
+        })
+
+        manifest = builder.build()
+
+        self.assertEqual(manifest["host_environment"]["host_name"], "Ableton Live")
+        self.assertFalse(validate_manifest_invariants(manifest))
+        claim = next(
+            c for c in manifest["claim_summary"] if c["claim"] == "host_application"
+        )
+        self.assertEqual(claim["value"], "Ableton Live")
+        self.assertEqual(claim["apw:proof_level"], "directly_observed")
+
+    def test_an_unnamed_host_never_reads_as_an_observation(self):
+        builder = ManifestBuilder(session_id="s1")
+        builder.set_host_environment({
+            "status": "host_unrecognised",
+            "host_recognised": False,
+            "host_name": None,
+            "host_executable_name": "SomeDaw",
+            "wrapper_format": "AudioUnit",
+            "basis": "The plug-in wrapper did not recognise the host application.",
+            "apw:proof_level": "unknown_unobserved",
+        })
+
+        manifest = builder.build()
+
+        self.assertFalse(validate_manifest_invariants(manifest))
+        claim = next(
+            c for c in manifest["claim_summary"] if c["claim"] == "host_application"
+        )
+        self.assertEqual(claim["value"], "unknown")
+        self.assertEqual(claim["apw:proof_level"], "unknown_unobserved")
+
+    def test_schema_rejects_a_host_named_without_recognition(self):
+        manifest = ManifestBuilder(session_id="s1").build()
+        manifest["host_environment"] = {
+            "status": "host_unrecognised",
+            "host_recognised": True,
+            "host_name": "Unknown",
+            "apw:proof_level": "directly_observed",
+        }
+
+        errors = validate_manifest_invariants(manifest)
+
+        self.assertIn("an unidentified host_environment must remain unknown_unobserved", errors)
+        self.assertIn("an unidentified host_environment must not name a host", errors)
+        self.assertIn(
+            "an unidentified host_environment must not report the host as recognised", errors
+        )
+
+    def test_a_manifest_without_a_host_environment_stays_valid(self):
+        manifest = ManifestBuilder(session_id="s1").build()
+
+        self.assertNotIn("host_environment", manifest)
+        self.assertFalse(validate_manifest_invariants(manifest))
+        claim = next(
+            c for c in manifest["claim_summary"] if c["claim"] == "host_application"
+        )
+        self.assertEqual(claim["value"], "unknown")
+        self.assertEqual(claim["apw:proof_level"], "unknown_unobserved")
 
     def test_write_json(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

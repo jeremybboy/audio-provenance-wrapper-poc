@@ -1,5 +1,13 @@
 # Multi-Layer Edit Observation Architecture
 
+> **Status: partially shipped.** Of the layers below, the plugin audio path
+> (Layer 1), the project file differ (Layer 3, `.als` parsing feeding
+> `session_facts` and `project_diff` evidence into every manifest), and
+> filesystem observation (Layer 5, sample import watching) are implemented.
+> `daemon/input_capture/` and `daemon/screen_observer/` are unimplemented
+> stubs, so correlation rules that depend on them cannot fire.
+> The demo makes no claims that rest on this document.
+
 ## Problem Statement
 
 A VST3 plugin can only observe audio buffers flowing through it. It cannot see
@@ -72,6 +80,7 @@ computes per-window (4096 sample) features.
 | `transport_change` | The DAW started/stopped playback, changed BPM, entered record mode |
 | `midi_event` | A MIDI note or controller message passed through the plugin |
 | `session_config_change` | Sample rate, channel count, or buffer size changed |
+| `host_environment` | Which host application loaded the plugin, and in which plugin format |
 
 **Proof level:** `directly_observed`
 
@@ -187,7 +196,7 @@ programmatic/scripted automation, with proof level `inferred`.
 
 ---
 
-## Layer 3: Project File Differ
+## Layer 3: Project File Differ (Implemented)
 
 **Source:** DAW project file on disk
 
@@ -759,6 +768,7 @@ support VST3 (or AU/CLAP/AAX with corresponding plugin builds).
 | `transport_change` | `transport_state` |
 | `midi_event` | `midi_event_type`, `midi_channel` |
 | `session_config_change` | `sample_rate_hz`, `channel_count` |
+| `host_environment` | `host_recognised`, `wrapper_format` |
 
 ### Layer 2: Input Capture (directly_observed / inferred)
 

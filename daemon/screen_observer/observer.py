@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -269,7 +268,7 @@ class ScreenObserver:
             time.sleep(interval / 1000.0)
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Observe the DAW window via periodic screen capture and feature extraction.",
     )
@@ -285,7 +284,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_args(argv or [])
+    args = parse_args(argv)
     log.info(
         "Screen observer scaffold loaded. Platform capture integration pending. "
         "Target: %s",

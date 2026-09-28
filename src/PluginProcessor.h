@@ -4,6 +4,8 @@
 
 #include "AudioObserver.h"
 #include "EventEmitter.h"
+#include "SessionActionLog.h"
+#include "VerificationClient.h"
 
 #include <atomic>
 #include <cstdint>
@@ -19,9 +21,10 @@ public:
         std::uint64_t lastBufferSeenMilliseconds = 0;
         std::uint64_t lastNonSilentBufferSeenMilliseconds = 0;
         bool lastBufferHadAudio = false;
+        bool lastCallbackWasBypassed = false;
     };
 
-    AudioProvenanceCaptureAudioProcessor();
+    explicit AudioProvenanceCaptureAudioProcessor (int daemonPort = 9876);
     ~AudioProvenanceCaptureAudioProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -30,6 +33,11 @@ public:
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override;
     void processBlock (juce::AudioBuffer<double>& buffer, juce::MidiBuffer& midiMessages) override;
+    void processBlockBypassed (juce::AudioBuffer<float>& buffer,
+                               juce::MidiBuffer& midiMessages) override;
+    void processBlockBypassed (juce::AudioBuffer<double>& buffer,
+                               juce::MidiBuffer& midiMessages) override;
+    void reset() override;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override;
@@ -53,6 +61,27 @@ public:
 
     // Granular observation stats for the UI.
     apw::AudioObserver& getAudioObserver() noexcept { return audioObserver; }
+    const apw::EventEmitter& getEventEmitter() const noexcept { return eventEmitter; }
+    std::uint64_t getHighestPreparedSequence() const noexcept { return eventSequence.load (std::memory_order_relaxed); }
+    const juce::String& getPluginInstanceId() const noexcept { return pluginInstanceId; }
+    const juce::String& getPluginCaptureSessionId() const noexcept { return pluginCaptureSessionId; }
+
+    void requestVerification (const juce::File& file);
+    apw::VerificationClient::Result getVerificationResult() const { return verificationClient.getResult(); }
+    const apw::VerificationClient& getVerificationClient() const noexcept { return verificationClient; }
+
+    bool isSigningArmed() const noexcept { return signingArmed.load (std::memory_order_relaxed); }
+    void setSigningArmed (bool shouldBeArmed);
+    juce::int64 getArmedAtUnixSeconds() const noexcept { return armedAtUnixSeconds.load (std::memory_order_relaxed); }
+    juce::String getSigningIdentityFingerprint() const;
+
+    bool hasTelemetryConsent() const noexcept { return sessionActionLog.hasConsent(); }
+    void setTelemetryConsent (bool granted);
+    const apw::SessionActionLog& getSessionActionLog() const noexcept { return sessionActionLog; }
+    std::uint64_t getRejectedStateRestoreCount() const noexcept
+    {
+        return rejectedStateRestores.load (std::memory_order_relaxed);
+    }
 
 private:
     template <typename SampleType>
@@ -61,16 +90,58 @@ private:
     template <typename SampleType>
     void observeAudioBuffer (const juce::AudioBuffer<SampleType>& buffer) noexcept;
 
+    template <typename SampleType>
+    void handleBypassedBuffer (juce::AudioBuffer<SampleType>& buffer) noexcept;
+
+    static bool hasSafeStateEnvelope (const void* data, int sizeInBytes) noexcept;
+
+    struct HostObservation
+    {
+        bool recognised = false;
+        juce::String name;
+        juce::String executableName;
+        juce::String wrapperFormat;
+    };
+
+    static HostObservation observeHost (WrapperType wrapper);
+
+    // IMPORTANT: every event reaching the daemon must pass through here. The
+    // daemon tracks stream continuity by event_sequence, so an event emitted
+    // around this method opens a permanent gap in the chain.
+    void emitEnrichedEvent (const juce::String& jsonEvent);
+    void emitHostEnvironment();
+
     std::atomic<int> observedChannelCount { 0 };
     std::atomic<int> observedSampleRateHz { 0 };
     std::atomic<int> observedBufferSizeSamples { 0 };
     std::atomic<std::uint64_t> lastBufferSeenMilliseconds { 0 };
     std::atomic<std::uint64_t> lastNonSilentBufferSeenMilliseconds { 0 };
     std::atomic<bool> lastBufferHadAudio { false };
+    std::atomic<bool> lastCallbackWasBypassed { false };
 
-    // Granular observation pipeline (emitter must outlive observer).
+    // The host process cannot change for the life of this instance, so it is
+    // observed once. Re-querying it per prepareToPlay retains allocations that
+    // the headless soak gate counts as steady-state growth.
+    const HostObservation observedHost;
+
+    // Granular observation pipeline (identifiers and emitter must outlive observer).
+    const juce::String pluginInstanceId;
+    const juce::String pluginCaptureSessionId;
     apw::EventEmitter eventEmitter;
     apw::AudioObserver audioObserver;
+    apw::VerificationClient verificationClient;
+    apw::SessionActionLog sessionActionLog;
+    std::atomic<std::uint64_t> eventSequence { 0 };
+    std::atomic<bool> signingArmed { false };
+    std::atomic<juce::int64> armedAtUnixSeconds { 0 };
+    std::atomic<std::uint64_t> rejectedStateRestores { 0 };
+
+    static constexpr int maxPluginStateBytes = 4096;
+
+    static constexpr std::uint64_t signingIdentityRefreshMilliseconds = 2000;
+    mutable juce::CriticalSection signingIdentityLock;
+    mutable juce::String signingIdentityFingerprint;
+    mutable std::uint64_t signingIdentityCheckedAtMilliseconds = 0;
 
     // Pre-allocated buffer for double-to-float conversion.
     juce::AudioBuffer<float> doubleConversionBuffer;

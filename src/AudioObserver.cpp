@@ -33,7 +33,7 @@ void AudioObserver::start (EventCallback callback)
 void AudioObserver::stop()
 {
     signalThreadShouldExit();
-    stopThread (2000);
+    stopThread (500);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -45,6 +45,9 @@ void AudioObserver::pushAudioBlock (const float* const* channelData,
 {
     if (numChannels <= 0 || numSamples <= 0)
         return;
+
+    buffersSubmitted.fetch_add (1, std::memory_order_relaxed);
+    samplesSubmitted.fetch_add (static_cast<std::uint64_t> (numSamples), std::memory_order_relaxed);
 
     int start1, size1, start2, size2;
     audioFifo.prepareToWrite (numSamples, start1, size1, start2, size2);
@@ -65,50 +68,103 @@ void AudioObserver::pushAudioBlock (const float* const* channelData,
     if (size1 > 0) writeMono (start1, size1, 0);
     if (size2 > 0) writeMono (start2, size2, size1);
 
-    audioFifo.finishedWrite (size1 + size2);
+    const auto written = size1 + size2;
+    audioFifo.finishedWrite (written);
+    const auto dropped = numSamples - written;
+    if (dropped > 0)
+    {
+        fifoSamplesDropped.fetch_add (static_cast<std::uint64_t> (dropped), std::memory_order_relaxed);
+        fifoWindowsDropped.fetch_add (1, std::memory_order_relaxed);
+    }
+}
+
+void AudioObserver::recordExternalAudioDrop (int numSamples) noexcept
+{
+    if (numSamples <= 0)
+        return;
+    buffersSubmitted.fetch_add (1, std::memory_order_relaxed);
+    samplesSubmitted.fetch_add (static_cast<std::uint64_t> (numSamples), std::memory_order_relaxed);
+    fifoSamplesDropped.fetch_add (static_cast<std::uint64_t> (numSamples), std::memory_order_relaxed);
+    fifoWindowsDropped.fetch_add (1, std::memory_order_relaxed);
+}
+
+void AudioObserver::recordBypassedBlock (int numSamples) noexcept
+{
+    if (numSamples <= 0)
+        return;
+
+    bypassedBuffers.fetch_add (1, std::memory_order_relaxed);
+    bypassedSamples.fetch_add (static_cast<std::uint64_t> (numSamples),
+                               std::memory_order_relaxed);
+    setBypassActive (true);
+}
+
+void AudioObserver::setBypassActive (bool active) noexcept
+{
+    if (bypassActive.exchange (active, std::memory_order_acq_rel) != active)
+        observationBoundaryGeneration.fetch_add (1, std::memory_order_release);
+}
+
+void AudioObserver::markLifecycleDiscontinuity() noexcept
+{
+    observationBoundaryGeneration.fetch_add (1, std::memory_order_release);
 }
 
 void AudioObserver::pushMidiMessages (const juce::MidiBuffer& midi)
 {
     for (const auto metadata : midi)
     {
-        const auto msg = metadata.getMessage();
+        // IMPORTANT: audio thread. metadata.getMessage() heap-allocates for any
+        // message over 8 bytes (MTC full-frame, sysex), so the raw bytes are
+        // read in place instead.
+        const auto* bytes = metadata.data;
+        const auto numBytes = metadata.numBytes;
+        const auto status = static_cast<std::uint8_t> (numBytes > 0 ? bytes[0] : 0);
+        const auto kind = static_cast<std::uint8_t> (status & 0xf0);
         MidiRecord record {};
 
-        if (msg.isNoteOn())
+        if (kind == 0x90 && numBytes >= 3)
         {
-            record.type  = 0x90;
-            record.data1 = static_cast<std::uint8_t> (msg.getNoteNumber());
-            record.data2 = static_cast<std::uint8_t> (msg.getVelocity());
+            const auto velocity = static_cast<std::uint8_t> (bytes[2] & 0x7f);
+            record.type  = velocity > 0 ? 0x90 : 0x80;
+            record.data1 = static_cast<std::uint8_t> (bytes[1] & 0x7f);
+            record.data2 = velocity;
         }
-        else if (msg.isNoteOff())
+        else if (kind == 0x80 && numBytes >= 3)
         {
             record.type  = 0x80;
-            record.data1 = static_cast<std::uint8_t> (msg.getNoteNumber());
-            record.data2 = static_cast<std::uint8_t> (msg.getVelocity());
+            record.data1 = static_cast<std::uint8_t> (bytes[1] & 0x7f);
+            record.data2 = static_cast<std::uint8_t> (bytes[2] & 0x7f);
         }
-        else if (msg.isController())
+        else if (kind == 0xb0 && numBytes >= 3)
         {
             record.type  = 0xB0;
-            record.data1 = static_cast<std::uint8_t> (msg.getControllerNumber());
-            record.data2 = static_cast<std::uint8_t> (msg.getControllerValue());
+            record.data1 = static_cast<std::uint8_t> (bytes[1] & 0x7f);
+            record.data2 = static_cast<std::uint8_t> (bytes[2] & 0x7f);
         }
-        else if (msg.isProgramChange())
+        else if (kind == 0xc0 && numBytes >= 2)
         {
             record.type  = 0xC0;
-            record.data1 = static_cast<std::uint8_t> (msg.getProgramChangeNumber());
+            record.data1 = static_cast<std::uint8_t> (bytes[1] & 0x7f);
             record.data2 = 0;
         }
         else
         {
+            // Pitch bend, aftertouch, sysex, truncated runs, etc. are not
+            // captured; an uncounted discard would let the manifest claim zero
+            // MIDI loss for a performance whose expression data was never observed.
+            unsupportedMidiEventsDropped.fetch_add (1, std::memory_order_relaxed);
             continue;
         }
 
-        record.channel = static_cast<std::uint8_t> (msg.getChannel());
+        record.channel = static_cast<std::uint8_t> ((status & 0x0f) + 1);
 
         int s1, sz1, s2, sz2;
         midiFifo.prepareToWrite (1, s1, sz1, s2, sz2);
-        if (sz1 > 0) midiFifoBuffer[static_cast<size_t> (s1)] = record;
+        if (sz1 > 0)
+            midiFifoBuffer[static_cast<size_t> (s1)] = record;
+        else
+            midiEventsDropped.fetch_add (1, std::memory_order_relaxed);
         midiFifo.finishedWrite (sz1 + sz2);
     }
 }
@@ -136,9 +192,20 @@ void AudioObserver::updateTransportState (juce::AudioPlayHead* playHead)
 
 void AudioObserver::updateSessionConfig (int sampleRate, int channelCount, int bufferSize)
 {
-    sessionSampleRate.store (sampleRate, std::memory_order_relaxed);
-    sessionChannelCount.store (channelCount, std::memory_order_relaxed);
-    sessionBufferSize.store (bufferSize, std::memory_order_relaxed);
+    // IMPORTANT: the FIFO holds up to 16 windows captured under the current
+    // configuration. Publishing the new rate here would stamp those samples
+    // with a rate they were never captured at, so the change is staged and the
+    // observer thread adopts it once it has discarded what it cannot describe.
+    if (! sessionConfigChangePending.load (std::memory_order_acquire)
+        && sampleRate == sessionSampleRate.load (std::memory_order_relaxed)
+        && channelCount == sessionChannelCount.load (std::memory_order_relaxed)
+        && bufferSize == sessionBufferSize.load (std::memory_order_relaxed))
+        return;
+
+    pendingSampleRate.store (sampleRate, std::memory_order_relaxed);
+    pendingChannelCount.store (channelCount, std::memory_order_relaxed);
+    pendingBufferSize.store (bufferSize, std::memory_order_relaxed);
+    sessionConfigChangePending.store (true, std::memory_order_release);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -149,31 +216,136 @@ void AudioObserver::run()
 {
     while (! threadShouldExit())
     {
-        while (audioFifo.getNumReady() >= kWindowSize && ! threadShouldExit())
-        {
-            int start1, size1, start2, size2;
-            audioFifo.prepareToRead (kWindowSize, start1, size1, start2, size2);
-
-            if (size1 > 0)
-                std::copy (audioFifoBuffer.begin() + start1,
-                           audioFifoBuffer.begin() + start1 + size1,
-                           windowBuffer.begin());
-            if (size2 > 0)
-                std::copy (audioFifoBuffer.begin() + start2,
-                           audioFifoBuffer.begin() + start2 + size2,
-                           windowBuffer.begin() + size1);
-
-            audioFifo.finishedRead (size1 + size2);
-
-            processWindow (windowBuffer.data(), kWindowSize);
-        }
-
+        applyPendingObservationBoundary();
+        applyPendingSessionConfig();
+        checkSessionConfigChanges();
+        drainReadyWindows (true);
         drainMidiEvents();
         checkTransportChanges();
-        checkSessionConfigChanges();
 
         juce::Thread::sleep (5);
     }
+
+    // Teardown: flush a fixed number of complete windows, then account the
+    // remainder as lost. Shutdown cost is a constant even after an offline
+    // render has saturated the queue.
+    applyPendingObservationBoundary();
+    applyPendingSessionConfig();
+    const auto readyBeforeFlush = audioFifo.getNumReady();
+    shutdownReadySamplesBeforeFlush.store (
+        static_cast<std::uint64_t> (juce::jmax (0, readyBeforeFlush)),
+        std::memory_order_relaxed);
+    shutdownWindowsFlushed.store (
+        static_cast<std::uint64_t> (drainReadyWindows (false, kMaxShutdownFlushWindows)),
+        std::memory_order_relaxed);
+    const auto leftover = audioFifo.getNumReady();
+    if (leftover > 0)
+    {
+        int start1, size1, start2, size2;
+        audioFifo.prepareToRead (leftover, start1, size1, start2, size2);
+        audioFifo.finishedRead (size1 + size2);
+        fifoSamplesDropped.fetch_add (static_cast<std::uint64_t> (size1 + size2),
+                                      std::memory_order_relaxed);
+        shutdownSamplesDiscardedAfterFlush.store (
+            static_cast<std::uint64_t> (size1 + size2), std::memory_order_relaxed);
+        fifoWindowsDropped.fetch_add (1, std::memory_order_relaxed);
+    }
+    drainMidiEvents();
+    flushAllKnobTurns (transportSamplePos.load (std::memory_order_relaxed));
+}
+
+void AudioObserver::applyPendingSessionConfig()
+{
+    if (! sessionConfigChangePending.load (std::memory_order_acquire))
+        return;
+
+    const auto sampleRate   = pendingSampleRate.load (std::memory_order_relaxed);
+    const auto channelCount = pendingChannelCount.load (std::memory_order_relaxed);
+    const auto bufferSize   = pendingBufferSize.load (std::memory_order_relaxed);
+
+    const bool describesDifferentAudio =
+        sampleRate != sessionSampleRate.load (std::memory_order_relaxed)
+        || channelCount != sessionChannelCount.load (std::memory_order_relaxed);
+
+    if (describesDifferentAudio)
+    {
+        discardQueuedAudio();
+        resetFeatureContinuity();
+        observationDiscontinuities.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    sessionSampleRate.store (sampleRate, std::memory_order_relaxed);
+    sessionChannelCount.store (channelCount, std::memory_order_relaxed);
+    sessionBufferSize.store (bufferSize, std::memory_order_relaxed);
+    sessionConfigChangePending.store (false, std::memory_order_release);
+}
+
+void AudioObserver::applyPendingObservationBoundary()
+{
+    const auto generation = observationBoundaryGeneration.load (std::memory_order_acquire);
+    if (generation == appliedObservationBoundaryGeneration)
+        return;
+
+    discardQueuedAudio();
+    resetFeatureContinuity();
+    observationDiscontinuities.fetch_add (
+        generation - appliedObservationBoundaryGeneration, std::memory_order_relaxed);
+    appliedObservationBoundaryGeneration = generation;
+}
+
+void AudioObserver::discardQueuedAudio() noexcept
+{
+    const auto leftover = audioFifo.getNumReady();
+    if (leftover <= 0)
+        return;
+
+    int start1, size1, start2, size2;
+    audioFifo.prepareToRead (leftover, start1, size1, start2, size2);
+    const auto discarded = size1 + size2;
+    audioFifo.finishedRead (discarded);
+    fifoSamplesDropped.fetch_add (static_cast<std::uint64_t> (discarded),
+                                  std::memory_order_relaxed);
+    // This is an affected observation segment, not a fabricated exact count of
+    // 4096-sample windows: a lifecycle boundary can discard a partial window.
+    fifoWindowsDropped.fetch_add (1, std::memory_order_relaxed);
+}
+
+void AudioObserver::resetFeatureContinuity()
+{
+    previousHash.clear();
+    prevWindowHadAudio = false;
+    prevSpectralCentroid = 0.0;
+    prevBands = {};
+
+    juce::SpinLock::ScopedLockType lock (lastHashLock);
+    lastHashHex.clear();
+}
+
+int AudioObserver::drainReadyWindows (bool stopOnExitSignal, int maxWindows)
+{
+    int drained = 0;
+    while (audioFifo.getNumReady() >= kWindowSize
+           && ! (stopOnExitSignal && threadShouldExit())
+           && (maxWindows < 0 || drained < maxWindows))
+    {
+        int start1, size1, start2, size2;
+        audioFifo.prepareToRead (kWindowSize, start1, size1, start2, size2);
+
+        if (size1 > 0)
+            std::copy (audioFifoBuffer.begin() + start1,
+                       audioFifoBuffer.begin() + start1 + size1,
+                       windowBuffer.begin());
+        if (size2 > 0)
+            std::copy (audioFifoBuffer.begin() + start2,
+                       audioFifoBuffer.begin() + start2 + size2,
+                       windowBuffer.begin() + size1);
+
+        audioFifo.finishedRead (size1 + size2);
+
+        processWindow (windowBuffer.data(), kWindowSize);
+        ++drained;
+    }
+    return drained;
 }
 
 void AudioObserver::processWindow (const float* data, int numSamples)
@@ -189,31 +361,31 @@ void AudioObserver::processWindow (const float* data, int numSamples)
     const auto zcr      = computeZeroCrossingRate (data, numSamples);
     const auto centroid = computeSpectralCentroid (data, numSamples);
     const bool hasAudio = rms > kSilenceThreshold;
+    double peak = 0.0;
+    for (int i = 0; i < numSamples; ++i)
+        peak = std::max (peak, std::abs (static_cast<double> (data[i])));
+    const auto crestFactor = rms > 1.0e-9 ? peak / rms : 0.0;
+    juce::Array<juce::var> energyEnvelope;
+    constexpr int envelopeSegments = 4;
+    for (int segment = 0; segment < envelopeSegments; ++segment)
+    {
+        const auto start = segment * numSamples / envelopeSegments;
+        const auto end = (segment + 1) * numSamples / envelopeSegments;
+        const auto segmentRms = computeRMS (data + start, end - start);
+        energyEnvelope.add (rms > 1.0e-9 ? segmentRms / rms : 0.0);
+    }
 
     // Spectral band profile (uses fftWorkspace already populated by centroid).
     const auto bands = computeSpectralBands (numSamples);
 
     auto windowHash = computeChainedHash (data, numSamples);
     auto prevHash   = previousHash.isEmpty() ? juce::String ("genesis") : previousHash;
-
-    // ── Silence throttling ──
-    // Always hash (chain integrity) but only emit UDP events at full rate
-    // when audio is present.  During sustained silence, emit once every
-    // kSilenceEmitInterval windows (~1 s) to avoid flooding the daemon.
-    bool shouldEmit = true;
-    if (! hasAudio)
-    {
-        ++consecutiveSilentWindows;
-        shouldEmit = (consecutiveSilentWindows == 1)
-                  || (consecutiveSilentWindows % kSilenceEmitInterval == 0);
-    }
-    else
-    {
-        consecutiveSilentWindows = 0;
-    }
+    totalWindowsHashed.fetch_add (1, std::memory_order_relaxed);
 
     // ── buffer_hash event ──
-    if (eventCallback && shouldEmit)
+    // Every window is emitted so the daemon can verify the complete chain.
+    // At 48 kHz this is about twelve compact events per second.
+    if (eventCallback)
     {
         auto json = buildJsonEvent (EventTypes::bufferHash, timestampMs, samplePos,
         {
@@ -221,14 +393,14 @@ void AudioObserver::processWindow (const float* data, int numSamples)
             { "prev_hash",            prevHash },
             { "rms_level",            rms },
             { "zero_crossing_rate",   zcr },
+            { "crest_factor",         crestFactor },
+            { "energy_envelope",      juce::var (energyEnvelope) },
             { "spectral_centroid_hz", centroid },
             { "channel_count",        channels },
             { "sample_rate_hz",       sampleRate },
             { "window_size_samples",  numSamples },
             { "bpm",                  bpmX100 / 100.0 },
-            { "silent_windows_skipped", consecutiveSilentWindows > 1
-                                        ? juce::var (consecutiveSilentWindows - 1)
-                                        : juce::var (0) },
+            { "silent_windows_skipped", 0 },
             { "band_low",  bands.low },
             { "band_mid",  bands.mid },
             { "band_high", bands.high }
@@ -282,7 +454,7 @@ void AudioObserver::processWindow (const float* data, int numSamples)
         const double dHigh = std::abs (bands.high - prevBands.high);
         const double maxDelta = std::max ({ dLow, dMid, dHigh });
 
-        if (maxDelta > kBandShiftThreshold && eventCallback && shouldEmit)
+        if (maxDelta > kBandShiftThreshold && eventCallback)
         {
             auto json = buildJsonEvent ("spectral_profile_change", timestampMs, samplePos,
             {
@@ -306,8 +478,6 @@ void AudioObserver::processWindow (const float* data, int numSamples)
     prevBands = bands;
     if (hasAudio)
         prevSpectralCentroid = centroid;
-
-    totalWindowsHashed.fetch_add (1, std::memory_order_relaxed);
 
     {
         juce::SpinLock::ScopedLockType lock (lastHashLock);
@@ -447,9 +617,12 @@ void AudioObserver::drainMidiEvents()
             // emit a single "parameter_change" event with start/end values.
             if (rec.type == 0xB0 && rec.data1 < kMaxCCTracked)
             {
-                auto& cc = ccStates[rec.data1];
+                const int chIdx = juce::jlimit (0, kMidiChannels - 1,
+                                                static_cast<int> (rec.channel) - 1);
+                auto& cc = ccStates[chIdx][rec.data1];
                 if (cc.lastValue < 0)
                 {
+                    cc.firstValue   = rec.data2;
                     cc.lastValue    = rec.data2;
                     cc.changeCount  = 1;
                     cc.firstChangeMs = timestampMs;
@@ -457,28 +630,22 @@ void AudioObserver::drainMidiEvents()
                 }
                 else if (timestampMs - cc.lastChangeMs < kKnobTurnWindowMs)
                 {
-                    cc.lastValue   = rec.data2;
-                    cc.changeCount += 1;
-                    cc.lastChangeMs = timestampMs;
+                    // A repeated identical value is not a change: counting it
+                    // fabricates a knob turn whose start_value equals its
+                    // end_value out of a flat automation segment or a
+                    // controller re-sending a held pedal.
+                    if (rec.data2 != cc.lastValue)
+                    {
+                        cc.lastValue   = rec.data2;
+                        cc.changeCount += 1;
+                        cc.lastChangeMs = timestampMs;
+                    }
                 }
                 else
                 {
                     // Window expired: flush previous knob turn if it qualifies.
-                    if (cc.changeCount >= kKnobTurnMinChanges && eventCallback)
-                    {
-                        auto json = buildJsonEvent ("parameter_change", cc.firstChangeMs, samplePos,
-                        {
-                            { "midi_channel",    static_cast<int> (rec.channel) },
-                            { "cc_number",       static_cast<int> (rec.data1) },
-                            { "start_value",     static_cast<int> (cc.lastValue) },
-                            { "end_value",       static_cast<int> (rec.data2) },
-                            { "change_count",    cc.changeCount },
-                            { "duration_ms",     static_cast<int> (cc.lastChangeMs - cc.firstChangeMs) }
-                        });
-                        eventCallback (json);
-                        totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
-                    }
-                    // Start new tracking window.
+                    flushKnobTurn (chIdx, static_cast<int> (rec.data1), samplePos);
+                    cc.firstValue    = rec.data2;
                     cc.lastValue     = rec.data2;
                     cc.changeCount   = 1;
                     cc.firstChangeMs = timestampMs;
@@ -516,19 +683,21 @@ void AudioObserver::drainMidiEvents()
         midiFifo.finishedRead (size1 + size2);
     }
 
-    // ── Flush any in-progress knob turns that have gone stale ──
-    for (int cc = 0; cc < kMaxCCTracked; ++cc)
+    flushExpiredKnobTurns (timestampMs, samplePos);
+}
+
+void AudioObserver::flushKnobTurn (int channelIndex, int ccNumber, juce::int64 samplePos)
+{
+    auto& state = ccStates[channelIndex][ccNumber];
+    if (state.changeCount >= kKnobTurnMinChanges)
     {
-        auto& state = ccStates[cc];
-        if (state.changeCount >= kKnobTurnMinChanges
-            && timestampMs - state.lastChangeMs >= kKnobTurnWindowMs
-            && eventCallback)
+        if (eventCallback)
         {
             auto json = buildJsonEvent ("parameter_change", state.firstChangeMs, samplePos,
             {
-                { "midi_channel",    0 },
-                { "cc_number",       cc },
-                { "start_value",     state.lastValue },
+                { "midi_channel",    channelIndex + 1 },
+                { "cc_number",       ccNumber },
+                { "start_value",     state.firstValue },
                 { "end_value",       state.lastValue },
                 { "change_count",    state.changeCount },
                 { "duration_ms",     static_cast<int> (state.lastChangeMs - state.firstChangeMs) }
@@ -536,14 +705,38 @@ void AudioObserver::drainMidiEvents()
             eventCallback (json);
             totalEventsEmitted.fetch_add (1, std::memory_order_relaxed);
         }
-        if (state.changeCount > 0 && timestampMs - state.lastChangeMs >= kKnobTurnWindowMs)
+    }
+    else if (state.changeCount > 0)
+    {
+        // Sub-threshold CC activity (a sustain pedal press and release, one
+        // automation write) is aggregated away. An uncounted discard would let
+        // the manifest report zero MIDI loss for controller data that was
+        // observed and dropped.
+        subThresholdCcChangesDiscarded.fetch_add (static_cast<std::uint64_t> (state.changeCount),
+                                                  std::memory_order_relaxed);
+    }
+    state = {};
+}
+
+void AudioObserver::flushExpiredKnobTurns (std::uint64_t nowMs, juce::int64 samplePos)
+{
+    for (int ch = 0; ch < kMidiChannels; ++ch)
+    {
+        for (int cc = 0; cc < kMaxCCTracked; ++cc)
         {
-            state.lastValue    = -1;
-            state.changeCount  = 0;
-            state.firstChangeMs = 0;
-            state.lastChangeMs  = 0;
+            const auto& state = ccStates[ch][cc];
+            if (state.changeCount > 0 && nowMs - state.lastChangeMs >= kKnobTurnWindowMs)
+                flushKnobTurn (ch, cc, samplePos);
         }
     }
+}
+
+void AudioObserver::flushAllKnobTurns (juce::int64 samplePos)
+{
+    for (int ch = 0; ch < kMidiChannels; ++ch)
+        for (int cc = 0; cc < kMaxCCTracked; ++cc)
+            if (ccStates[ch][cc].changeCount > 0)
+                flushKnobTurn (ch, cc, samplePos);
 }
 
 void AudioObserver::checkTransportChanges()
@@ -614,9 +807,30 @@ void AudioObserver::checkSessionConfigChanges()
 // Stats
 // ──────────────────────────────────────────────────────────────────────
 
-int AudioObserver::getWindowSize() const noexcept         { return kWindowSize; }
-int AudioObserver::getTotalWindowsHashed() const noexcept { return totalWindowsHashed.load (std::memory_order_relaxed); }
-int AudioObserver::getTotalEventsEmitted() const noexcept { return totalEventsEmitted.load (std::memory_order_relaxed); }
+int AudioObserver::getWindowSize() const noexcept { return kWindowSize; }
+std::uint64_t AudioObserver::getTotalWindowsHashed() const noexcept { return totalWindowsHashed.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getTotalEventsEmitted() const noexcept { return totalEventsEmitted.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getBuffersSubmitted() const noexcept { return buffersSubmitted.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getSamplesSubmitted() const noexcept { return samplesSubmitted.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getFifoSamplesDropped() const noexcept { return fifoSamplesDropped.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getFifoWindowsDropped() const noexcept { return fifoWindowsDropped.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getMidiEventsDropped() const noexcept { return midiEventsDropped.load (std::memory_order_relaxed); }
+
+std::uint64_t AudioObserver::getUnsupportedMidiEventsDropped() const noexcept { return unsupportedMidiEventsDropped.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getSubThresholdCcChangesDiscarded() const noexcept { return subThresholdCcChangesDiscarded.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getBypassedBuffers() const noexcept { return bypassedBuffers.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getBypassedSamples() const noexcept { return bypassedSamples.load (std::memory_order_relaxed); }
+std::uint64_t AudioObserver::getObservationDiscontinuities() const noexcept { return observationDiscontinuities.load (std::memory_order_relaxed); }
+
+AudioObserver::ShutdownReport AudioObserver::getShutdownReport() const noexcept
+{
+    return {
+        shutdownReadySamplesBeforeFlush.load (std::memory_order_relaxed),
+        shutdownWindowsFlushed.load (std::memory_order_relaxed),
+        shutdownSamplesDiscardedAfterFlush.load (std::memory_order_relaxed),
+        static_cast<std::uint64_t> (kMaxShutdownFlushWindows)
+    };
+}
 
 juce::String AudioObserver::getLastHash() const
 {
