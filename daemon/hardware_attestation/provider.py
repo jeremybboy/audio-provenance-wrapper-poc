@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import abc
 import hashlib
+import hmac
+import json
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +116,17 @@ class HardwareProvider(abc.ABC):
         monotonic system clock attested by the SE.
         """
 
+    def last_cosignature_hash(self) -> str:
+        """Head of this device's cosignature chain, or 'genesis' if it has none."""
+        return "genesis"
+
+    def counter_scope(self) -> str:
+        """State what the monotonic counter is actually backed by."""
+        return "provider_defined"
+
+    def _record_cosignature(self, entangled_hash: str) -> None:
+        """Persist the new chain head. Providers without durable state keep none."""
+
     def bind_chain_root(self, chain_root_hash: str) -> HardwareBinding:
         """Bind a hash chain root to this hardware device.
 
@@ -165,6 +180,7 @@ class HardwareProvider(abc.ABC):
         )
         entangled_hash = hashlib.sha256(entangle_input).hexdigest()
         signature = self.sign(entangled_hash.encode())
+        self._record_cosignature(entangled_hash)
 
         return HardwareCosignature(
             entangled_hash=entangled_hash,
@@ -250,7 +266,7 @@ class TpmProvider(HardwareProvider):
 
 
 class SoftwareProvider(HardwareProvider):
-    """Fallback provider using filesystem-stored Ed25519 keys.
+    """Fallback provider using a filesystem-stored HMAC key.
 
     NOT attestable. Evidence produced with this provider carries proof level
     'directly_observed' for the hash chain but 'unknown_unobserved' for
@@ -265,49 +281,118 @@ class SoftwareProvider(HardwareProvider):
 
     def __init__(self, key_path: Path = Path("~/.apw/device_key.bin")) -> None:
         self.key_path = key_path.expanduser()
-        self._counter = 0
+        self._state_path = self.key_path.with_name(self.key_path.name + ".state.json")
+        self._state_lock = threading.Lock()
         self._seed = self._load_or_create_key()
         self._device_id = hashlib.sha256(self._seed).hexdigest()[:16]
-        self._public_key = hashlib.sha256(b"apw-pubkey-" + self._seed).hexdigest()
+
+    @staticmethod
+    def _restrict(path: Path) -> None:
+        """Keep the signing seed unreadable by other local users.
+
+        IMPORTANT: repaired on every load, not only on creation. Anyone who can
+        read the seed derives the device_id and forges a manifest_signature the
+        verifier accepts, and machines provisioned before this check existed
+        still carry the world-readable file.
+        """
+        if os.name == "nt":
+            # POSIX mode bits do not express Windows ACLs; nothing is enforced here.
+            log.warning("Signing seed %s: file permissions are not managed on Windows", path)
+            return
+        try:
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                os.chmod(path, 0o600)
+                log.warning("Tightened permissions on %s from %o to 600", path, mode)
+        except OSError:
+            log.warning("Could not restrict permissions on %s", path, exc_info=True)
 
     def _load_or_create_key(self) -> bytes:
         if self.key_path.exists():
+            self._restrict(self.key_path)
             return self.key_path.read_bytes()
-        import os
         seed = os.urandom(32)
         self.key_path.parent.mkdir(parents=True, exist_ok=True)
         self.key_path.write_bytes(seed)
+        self._restrict(self.key_path)
         log.info("Created software signing key at %s", self.key_path)
         return seed
+
+    def _read_state(self) -> dict[str, object]:
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def _write_state(self, state: dict[str, object]) -> None:
+        temporary = self._state_path.with_name(self._state_path.name + f".tmp-{os.getpid()}")
+        try:
+            temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+            temporary.replace(self._state_path)
+            self._restrict(self._state_path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            log.warning("Could not persist signer state to %s", self._state_path, exc_info=True)
+
+    def last_cosignature_hash(self) -> str:
+        value = self._read_state().get("last_cosignature_hash")
+        return value if isinstance(value, str) and value else "genesis"
+
+    def counter_scope(self) -> str:
+        return (
+            "persisted local file counter, not hardware-backed; rollback is prevented only "
+            "by filesystem permissions on the signer state file"
+        )
+
+    def _record_cosignature(self, entangled_hash: str) -> None:
+        with self._state_lock:
+            state = self._read_state()
+            state["last_cosignature_hash"] = entangled_hash
+            self._write_state(state)
 
     def device_identity(self) -> DeviceIdentity:
         return DeviceIdentity(
             device_id=self._device_id,
-            public_key_hex=self._public_key,
-            algorithm="hmac-sha256",
+            public_key_hex="",
+            algorithm="hmac-sha256-local",
             created_at_ms=int(self.key_path.stat().st_mtime * 1000),
         )
 
     def sign(self, data: bytes) -> bytes:
-        import hmac
         return hmac.new(self._seed, data, hashlib.sha256).digest()
 
     def verify(self, data: bytes, signature: bytes) -> bool:
-        import hmac
         expected = hmac.new(self._seed, data, hashlib.sha256).digest()
         return hmac.compare_digest(expected, signature)
 
+    @staticmethod
+    def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+        """Counter-varied keystream: HMAC(key, nonce || counter) per block.
+
+        A repeated fixed-key block (key * n) leaks identical ciphertext for
+        identical aligned plaintext blocks (ECB-style). Mixing in a
+        big-endian block counter makes every block's keystream distinct.
+        """
+        blocks = []
+        produced = 0
+        counter = 0
+        while produced < length:
+            block = hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest()
+            blocks.append(block)
+            produced += len(block)
+            counter += 1
+        return b"".join(blocks)[:length]
+
     def seal(self, plaintext: bytes) -> bytes:
-        import hmac
-        import os
         nonce = os.urandom(16)
         key = hmac.new(self._seed, b"apw-seal-" + nonce, hashlib.sha256).digest()
-        sealed = bytes(a ^ b for a, b in zip(plaintext, (key * ((len(plaintext) // 32) + 1))[:len(plaintext)]))
+        keystream = self._keystream(key, nonce, len(plaintext))
+        sealed = bytes(a ^ b for a, b in zip(plaintext, keystream))
         tag = hmac.new(key, sealed, hashlib.sha256).digest()[:16]
         return nonce + tag + sealed
 
     def unseal(self, sealed_data: bytes) -> bytes:
-        import hmac
         if len(sealed_data) < 32:
             raise ValueError("Sealed data too short")
         nonce = sealed_data[:16]
@@ -317,33 +402,70 @@ class SoftwareProvider(HardwareProvider):
         expected_tag = hmac.new(key, ciphertext, hashlib.sha256).digest()[:16]
         if not hmac.compare_digest(tag, expected_tag):
             raise ValueError("Sealed data integrity check failed")
-        return bytes(a ^ b for a, b in zip(ciphertext, (key * ((len(ciphertext) // 32) + 1))[:len(ciphertext)]))
+        keystream = self._keystream(key, nonce, len(ciphertext))
+        return bytes(a ^ b for a, b in zip(ciphertext, keystream))
 
     def monotonic_counter(self) -> int:
-        self._counter += 1
-        return self._counter
+        """Persisted across processes.
+
+        A per-process integer restarted at 1 on every launch, which made the
+        signed counter useless for the replay, reorder and drop detection the
+        HardwareProvider contract promises it is for.
+        """
+        with self._state_lock:
+            state = self._read_state()
+            raw = state.get("monotonic_counter")
+            current = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else 0
+            current += 1
+            state["monotonic_counter"] = current
+            self._write_state(state)
+            return current
 
     def clock_ms(self) -> int:
         return int(time.time() * 1000)
 
 
-def detect_provider() -> HardwareProvider:
-    """Auto-detect the best available hardware provider for this platform.
+def attestation_status(system: str | None = None) -> dict[str, object]:
+    """What this platform's provider proves. Never claims hardware it does not use.
 
-    Priority: Secure Enclave > TPM 2.0 > Software fallback.
+    Every platform currently maps to SoftwareProvider, so the answer is the
+    same on all of them: a local key file, not hardware-attested.
     """
     import platform
 
-    system = platform.system()
-
+    system = system or platform.system()
     if system == "Darwin":
-        log.info("macOS detected; Secure Enclave provider selected (stub)")
-        return SecureEnclaveProvider()
+        candidate = "Secure Enclave (not integrated)"
+    elif system == "Linux":
+        present = Path("/dev/tpm0").exists() or Path("/dev/tpmrm0").exists()
+        candidate = "TPM 2.0 device present (not integrated)" if present else "no TPM device node found"
+    elif system == "Windows":
+        candidate = "TPM via CNG/Platform Crypto Provider (not integrated)"
+    else:
+        candidate = "no hardware provider known for this platform"
+    return {
+        "platform": system or "unknown",
+        "provider": "SoftwareProvider",
+        "hardware_attested": False,
+        "proof_level": "unknown_unobserved",
+        "hardware_candidate": candidate,
+    }
 
-    if system == "Linux":
-        if Path("/dev/tpm0").exists() or Path("/dev/tpmrm0").exists():
-            log.info("TPM 2.0 device detected; TPM provider selected (stub)")
-            return TpmProvider()
 
-    log.warning("No hardware security module detected; using software fallback")
-    return SoftwareProvider()
+def detect_provider(
+    software_key_path: Path = Path("~/.apw/demo_signing_key.bin"),
+) -> HardwareProvider:
+    """Return the provider for this platform: always SoftwareProvider today.
+
+    No Secure Enclave, TPM or Windows platform-crypto provider is integrated on
+    any OS. The result is a local software integrity key and is logged as not
+    hardware-attested; see attestation_status() for the per-platform detail.
+    """
+    status = attestation_status()
+    log.warning(
+        "Hardware attestation unavailable on %s (%s); using a local software "
+        "integrity key that is not hardware-attested",
+        status["platform"],
+        status["hardware_candidate"],
+    )
+    return SoftwareProvider(key_path=software_key_path)

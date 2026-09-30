@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from daemon.common import sha256_file
+from daemon.common import append_jsonl, sha256_file
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +38,9 @@ class SendInfo:
 class TrackInfo:
     """Rich per-track metadata extracted from the .als XML."""
 
+    # IMPORTANT: display names are not unique (Cmd+D duplicates share
+    # EffectiveName); identity comparisons key on the XML Id attribute.
+    track_id: str
     name: str
     track_type: str
     devices: tuple[str, ...]
@@ -47,6 +50,7 @@ class TrackInfo:
     clip_count: int
     automation_point_count: int
     midi_note_count: int
+    device_chain_hashes: frozenset[str]
     group_id: str
     routing_input: str
     routing_output: str
@@ -66,6 +70,7 @@ class ProjectSnapshot:
     tracks: tuple[TrackInfo, ...]
     clip_count: int
     clip_hashes: frozenset[str]
+    clip_slot_hashes: dict[tuple[str, str], str]
     device_chain_hashes: frozenset[str]
     automation_point_count: int
     midi_note_count: int
@@ -75,6 +80,10 @@ class ProjectSnapshot:
     transport_loop_on: bool
     transport_loop_range: tuple[float, float]
     locator_count: int
+    # Populated only by parsers whose format records them. Not part of the
+    # emitted project_diff event for .als.
+    sample_rate: int | None = None
+    project_format: str = "ableton_als"
 
 
 @dataclass
@@ -116,13 +125,38 @@ class ProjectDiff:
         )
 
 
+# A watched .als is untrusted input: bound the gzip expansion and refuse DTDs
+# (no DOCTYPE means no entity expansion; Ableton never emits one).
+MAX_ALS_DECOMPRESSED_BYTES = 256 * 1024 * 1024
+_DOCTYPE_MARKER = b"<!DOCTYPE"
+
+
 def parse_als(path: Path) -> ET.Element:
     """Decompress and parse an Ableton .als file.
 
-    Stub: returns the parsed XML root element. Raises on invalid files.
+    Raises on invalid, oversized, or DTD-carrying files.
     """
+    parser = ET.XMLParser(target=ET.TreeBuilder())
+    total = 0
+    carry = b""
     with gzip.open(path, "rb") as f:
-        return ET.parse(f).getroot()
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_ALS_DECOMPRESSED_BYTES:
+                raise ValueError(
+                    f"{path} decompresses past {MAX_ALS_DECOMPRESSED_BYTES} bytes; refusing to parse"
+                )
+            if _DOCTYPE_MARKER in carry + chunk:
+                raise ValueError(f"{path} contains a DTD declaration; refusing to parse")
+            carry = chunk[-(len(_DOCTYPE_MARKER) - 1):]
+            parser.feed(chunk)
+    root = parser.close()
+    if not isinstance(root, ET.Element):
+        raise ValueError(f"{path} did not parse to an XML element")
+    return root
 
 
 def extract_snapshot(path: Path) -> ProjectSnapshot:
@@ -147,8 +181,11 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
 
     track_infos: list[TrackInfo] = []
 
+    clip_slot_hashes: dict[tuple[str, str], str] = {}
+
     if tracks_el is not None:
-        for track in tracks_el:
+        for track_index, track in enumerate(tracks_el):
+            track_id = track.get("Id") or f"pos-{track_index}"
             name_el = track.find("Name")
             name_val = ""
             if name_el is not None:
@@ -165,14 +202,21 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
             track_presets: list[str] = []
             track_samples: list[str] = []
             track_clip_infos: list[ClipInfo] = []
-            is_midi_track = track_type == "MidiTrack"
+            track_device_hashes: set[str] = set()
 
-            for clip_slot in track.iter("ClipSlot"):
+            for slot_index, clip_slot in enumerate(track.iter("ClipSlot")):
                 clip_count += 1
                 track_clips += 1
-                clip_hashes.add(hashlib.sha256(ET.tostring(clip_slot)).hexdigest()[:16])
+                slot_hash = hashlib.sha256(ET.tostring(clip_slot)).hexdigest()[:16]
+                clip_hashes.add(slot_hash)
+                # Slot identity mirrors track identity: the element's own Id,
+                # so a scene insert/delete does not shift every later slot's key.
+                slot_id = clip_slot.get("Id") or f"pos-{slot_index}"
+                clip_slot_hashes[(track_id, slot_id)] = slot_hash
 
-                clip_el = clip_slot.find(".//AudioClip") or clip_slot.find(".//MidiClip")
+                audio_clip_el = clip_slot.find(".//AudioClip")
+                midi_clip_el = clip_slot.find(".//MidiClip")
+                clip_el = audio_clip_el if audio_clip_el is not None else midi_clip_el
                 if clip_el is not None:
                     clip_name_el = clip_el.find("Name")
                     clip_name = clip_name_el.get("Value", "") if clip_name_el is not None else ""
@@ -196,7 +240,9 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
                     ))
 
             for device_chain in track.iter("DeviceChain"):
-                device_hashes.add(hashlib.sha256(ET.tostring(device_chain)).hexdigest()[:16])
+                chain_hash = hashlib.sha256(ET.tostring(device_chain)).hexdigest()[:16]
+                device_hashes.add(chain_hash)
+                track_device_hashes.add(chain_hash)
                 devices_el = device_chain.find(".//Devices")
                 if devices_el is not None:
                     for device in devices_el:
@@ -279,6 +325,7 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
                     pass
 
             track_infos.append(TrackInfo(
+                track_id=track_id,
                 name=name_val,
                 track_type=track_type,
                 devices=tuple(track_devices),
@@ -288,6 +335,7 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
                 clip_count=track_clips,
                 automation_point_count=track_auto,
                 midi_note_count=track_midi,
+                device_chain_hashes=frozenset(track_device_hashes),
                 group_id=group_id,
                 routing_input=routing_in,
                 routing_output=routing_out,
@@ -344,6 +392,7 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
         tracks=tuple(track_infos),
         clip_count=clip_count,
         clip_hashes=frozenset(clip_hashes),
+        clip_slot_hashes=clip_slot_hashes,
         device_chain_hashes=frozenset(device_hashes),
         automation_point_count=automation_count,
         midi_note_count=midi_note_count,
@@ -357,33 +406,37 @@ def extract_snapshot(path: Path) -> ProjectSnapshot:
 
 
 def compute_diff(previous: ProjectSnapshot, current: ProjectSnapshot) -> ProjectDiff:
-    prev_names = set(previous.track_names)
-    curr_names = set(current.track_names)
+    # Identity comparisons key on track_id / (track_id, slot): display names
+    # collide on duplicated tracks, and hash-set algebra reported every
+    # single-clip edit as a delete+add pair with clips_modified stuck at 0.
+    prev_by_id = {t.track_id: t for t in previous.tracks}
+    curr_by_id = {t.track_id: t for t in current.tracks}
 
-    new_clips = current.clip_hashes - previous.clip_hashes
-    removed_clips = previous.clip_hashes - current.clip_hashes
-    common_count = len(current.clip_hashes & previous.clip_hashes)
-    modified_clips = abs(current.clip_count - previous.clip_count) - len(new_clips) - len(removed_clips)
-    if modified_clips < 0:
-        modified_clips = 0
+    prev_slots = previous.clip_slot_hashes
+    curr_slots = current.clip_slot_hashes
+    shared_slots = prev_slots.keys() & curr_slots.keys()
+    modified_clips = sum(1 for key in shared_slots if prev_slots[key] != curr_slots[key])
 
-    prev_devices = previous.device_chain_hashes
-    curr_devices = current.device_chain_hashes
-    devices_changed: list[str] = []
-    if prev_devices != curr_devices:
-        for i, name in enumerate(current.track_names):
-            devices_changed.append(name)
+    devices_changed = sorted(
+        curr_by_id[track_id].name
+        for track_id in curr_by_id.keys() & prev_by_id.keys()
+        if curr_by_id[track_id].device_chain_hashes != prev_by_id[track_id].device_chain_hashes
+    )
 
     return ProjectDiff(
         timestamp_ms=int(time.time() * 1000),
         previous_file_hash=previous.file_hash,
         current_file_hash=current.file_hash,
-        tracks_added=sorted(curr_names - prev_names),
-        tracks_removed=sorted(prev_names - curr_names),
-        clips_added=len(new_clips),
-        clips_removed=len(removed_clips),
+        tracks_added=sorted(
+            curr_by_id[track_id].name for track_id in curr_by_id.keys() - prev_by_id.keys()
+        ),
+        tracks_removed=sorted(
+            prev_by_id[track_id].name for track_id in prev_by_id.keys() - curr_by_id.keys()
+        ),
+        clips_added=len(curr_slots.keys() - prev_slots.keys()),
+        clips_removed=len(prev_slots.keys() - curr_slots.keys()),
         clips_modified=modified_clips,
-        devices_changed=devices_changed if prev_devices != curr_devices else [],
+        devices_changed=devices_changed,
         automation_points_delta=current.automation_point_count - previous.automation_point_count,
         midi_notes_delta=current.midi_note_count - previous.midi_note_count,
         samples_added=current.sample_refs - previous.sample_refs,
@@ -395,11 +448,34 @@ def compute_diff(previous: ProjectSnapshot, current: ProjectSnapshot) -> Project
     )
 
 
-class ProjectWatcher:
-    """Watches an Ableton .als file for saves and emits structural diffs.
+def diff_to_event(diff: ProjectDiff) -> dict[str, object]:
+    """Serialize a diff as the project_diff evidence event both the daemon
+    and the standalone watcher write."""
+    return {
+        "event_type": "project_diff",
+        "proof_level": "inferred",
+        "source_timestamp_ms": diff.timestamp_ms,
+        "timestamp_ms": diff.timestamp_ms,
+        "daemon_observed_monotonic_ms": int(time.monotonic_ns() // 1_000_000),
+        "clips_added": diff.clips_added,
+        "clips_removed": diff.clips_removed,
+        "clips_modified": diff.clips_modified,
+        "tracks_added": diff.tracks_added,
+        "tracks_removed": diff.tracks_removed,
+        "devices_changed": diff.devices_changed,
+        "samples_added": sorted(diff.samples_added),
+        "samples_removed": sorted(diff.samples_removed),
+        "midi_notes_delta": diff.midi_notes_delta,
+        "automation_points_delta": diff.automation_points_delta,
+        "bpm_changed": diff.bpm_changed,
+    }
 
-    Stub: the polling loop is functional but the extract_snapshot parser
-    needs validation against real .als files across Ableton versions.
+
+class ProjectWatcher:
+    """Watches a project file for saves and emits structural diffs.
+
+    The parser is chosen by extension through daemon.project_formats. The .als
+    parser still needs validation against real files across Ableton versions.
     """
 
     def __init__(
@@ -415,11 +491,21 @@ class ProjectWatcher:
         self._previous_mtime_ns: int = 0
 
     def run_forever(self) -> None:
-        """Poll the project file and emit diffs on each save.
+        """Poll the project file and write a project_diff event on each save."""
+        from daemon.project_formats import (
+            UnsupportedProjectFormat,
+            detect_format,
+            parse_project,
+            unsupported_format_event,
+        )
 
-        Stub: actual implementation will also write events to the JSONL
-        evidence file, matching the pattern in evidence_receiver.
-        """
+        project_format = detect_format(self.project_path)
+        if project_format is not None and not project_format.supported:
+            log.warning("%s", UnsupportedProjectFormat(project_format, self.project_path))
+            append_jsonl(
+                self.evidence_path, unsupported_format_event(project_format, self.project_path)
+            )
+            return
         log.info("Watching %s for saves; writing %s", self.project_path, self.evidence_path)
 
         while True:
@@ -432,7 +518,7 @@ class ProjectWatcher:
             if stat.st_mtime_ns != self._previous_mtime_ns:
                 self._previous_mtime_ns = stat.st_mtime_ns
                 try:
-                    snapshot = extract_snapshot(self.project_path)
+                    snapshot = parse_project(self.project_path)
                 except Exception:
                     log.exception("Failed to parse %s", self.project_path)
                     time.sleep(self.poll_interval_seconds)
@@ -441,6 +527,10 @@ class ProjectWatcher:
                 if self._previous_snapshot is not None:
                     diff = compute_diff(self._previous_snapshot, snapshot)
                     if diff.has_changes():
+                        event = diff_to_event(diff)
+                        if snapshot.project_format != "ableton_als":
+                            event["project_format"] = snapshot.project_format
+                        append_jsonl(self.evidence_path, event)
                         log.info(
                             "Project diff: +%d/-%d/%d~ clips, %d samples added",
                             diff.clips_added,
@@ -454,11 +544,11 @@ class ProjectWatcher:
             time.sleep(self.poll_interval_seconds)
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Watch an Ableton .als project file and emit structural diffs.",
+        description="Watch a project file (.als, .rpp) and emit structural diffs.",
     )
-    parser.add_argument("project_path", type=Path, help="Path to the .als file.")
+    parser.add_argument("project_path", type=Path, help="Path to the project file.")
     parser.add_argument(
         "--evidence-file",
         type=Path,
@@ -476,7 +566,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_args(argv or [])
+    args = parse_args(argv)
     watcher = ProjectWatcher(
         project_path=args.project_path,
         evidence_path=args.evidence_file,

@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://audio-provenance-poc.local/schema/manifest-v0.9.json",
+  "title": "Audio Provenance POC Manifest",
+  "type": "object",
+  "required": [
+    "apw_version",
+    "schema",
+    "session_id",
+    "capture_session",
+    "created_at",
+    "observed_stems",
+    "stem_export_association",
+    "observation_coverage",
+    "daemon_receipt_acknowledgement",
+    "claim_summary",
+    "apw:unobserved",
+    "evidence_binding",
+    "portable_signature",
+    "manifest_signature",
+    "presentation",
+    "downstream_registration_handoff",
+    "c2pa_mapping"
+  ],
+  "$defs": {
+    "proofLevel": {
+      "enum": [
+        "directly_observed",
+        "inferred",
+        "user_declared",
+        "externally_verified",
+        "unknown_unobserved"
+      ]
+    },
+    "proofObject": {
+      "type": "object",
+      "required": ["apw:proof_level"],
+      "properties": {
+        "apw:proof_level": { "$ref": "#/$defs/proofLevel" }
+      }
+    }
+  },
+  "properties": {
+    "apw_version": { "type": "string" },
+    "schema": { "const": "audio-provenance-manifest-v0" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "capture_session": { "$ref": "#/$defs/proofObject" },
+    "created_at": { "type": "string" },
+    "observed_stems": {
+      "type": "array",
+      "items": {
+        "allOf": [
+          { "$ref": "#/$defs/proofObject" },
+          {
+            "required": [
+              "stem_id", "hash_chain_root", "hash_chain_length",
+              "source_category_proof_level", "plugin_instance_ids"
+            ]
+          }
+        ]
+      }
+    },
+    "export": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["file_path", "file_name", "sha256", "export_version"],
+          "properties": { "sha256": { "pattern": "^[0-9a-f]{64}$" } }
+        }
+      ]
+    },
+    "stem_export_association": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["status", "basis"],
+          "properties": {
+            "status": { "enum": ["inferred_match", "not_established", "unavailable"] }
+          }
+        }
+      ]
+    },
+    "observation_coverage": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["status", "basis", "counters"],
+          "properties": {
+            "status": {
+              "enum": ["complete_observed_path", "partial_observed_path", "unknown_coverage"]
+            }
+          }
+        }
+      ]
+    },
+    "host_environment": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["status", "host_recognised", "host_name", "basis"],
+          "properties": {
+            "status": {
+              "enum": [
+                "observed", "host_inferred", "host_unrecognised", "conflicting_observations", "unobserved"
+              ]
+            },
+            "identification": { "enum": ["inferred_from_executable_name"] },
+            "host_id": { "type": "string", "minLength": 1 },
+            "source_url": { "type": "string", "pattern": "^https://" },
+            "host_recognised": { "type": "boolean" },
+            "host_name": { "type": ["string", "null"] },
+            "host_executable_name": { "type": ["string", "null"] },
+            "wrapper_format": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "daemon_receipt_acknowledgement": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["protocol", "status", "streams", "counters", "scope"],
+          "properties": {
+            "protocol": { "const": "apw-local-udp-ack-v1" },
+            "status": { "enum": ["issued", "degraded", "unknown"] },
+            "streams": { "type": "array" },
+            "counters": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "claim_summary": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/proofObject" }
+    },
+    "apw:unobserved": { "type": "array", "items": { "type": "string" } },
+    "evidence_binding": { "$ref": "#/$defs/proofObject" },
+    "portable_signature": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": [
+            "algorithm", "public_key_hex", "signature_hex", "signed_content_hash",
+            "trust_scope", "signer_identity", "signer_identity_proof_level"
+          ],
+          "properties": {
+            "algorithm": { "const": "Ed25519" },
+            "trust_scope": { "const": "self_generated_demo_key_integrity" },
+            "signer_identity_proof_level": { "const": "unknown_unobserved" }
+          }
+        }
+      ]
+    },
+    "manifest_signature": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": [
+            "algorithm", "device_id", "public_key_hex", "signature_hex",
+            "signed_content_hash", "trust_scope", "hardware_attested"
+          ],
+          "properties": {
+            "trust_scope": { "enum": ["local_software_integrity", "hardware_provider"] },
+            "hardware_attested": { "type": "boolean" },
+            "signed_content_hash": { "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
+    },
+    "presentation": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["derived_from", "verifier_result", "downstream_handoff"],
+          "properties": {
+            "html_report": { "type": ["string", "null"] },
+            "bundle_index": { "type": ["string", "null"] },
+            "evidence_bundle": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "forgery_analysis": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["method", "scope", "suspicion_score", "analyzers"],
+          "properties": {
+            "suspicion_score": { "type": "number", "minimum": 0, "maximum": 1 },
+            "analyzers": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "time_anchor": {
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["status", "data_hash", "scope"],
+          "properties": {
+            "status": { "enum": ["anchored", "unavailable"] },
+            "data_hash": { "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
+    },
+    "time_anchor_opentimestamps": {
+      "description": "OpenTimestamps calendar receipt for the export hash. 'pending' asserts no external time; a completed proof is a sidecar .ots, never a rewrite of this signed record.",
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["status", "data_hash", "scope", "calendars"],
+          "properties": {
+            "status": { "enum": ["pending", "unavailable"] },
+            "data_hash": { "pattern": "^[0-9a-f]{64}$" },
+            "apw:proof_level": { "enum": ["inferred", "unknown_unobserved"] },
+            "calendars": { "type": "array" }
+          }
+        }
+      ]
+    },
+    "downstream_registration_handoff": { "type": "object" },
+    "c2pa_mapping": { "type": "object" },
+    "c2pa_claim": {
+      "description": "The signed C2PA claim. status 'unavailable' records why none was produced. Not in required: manifests written before this section existed remain valid.",
+      "allOf": [
+        { "$ref": "#/$defs/proofObject" },
+        {
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["embedded", "sidecar", "unavailable"] },
+            "validation": {
+              "type": "object",
+              "required": ["state", "trust_anchor_scope"],
+              "properties": {
+                "state": {
+                  "enum": [
+                    "verified",
+                    "registered_but_changed",
+                    "mark_found_claim_not_trusted",
+                    "nothing_found"
+                  ]
+                },
+                "trust_anchor_scope": { "const": "self_issued_local_root_only" }
+              }
+            },
+            "signer": {
+              "allOf": [
+                { "$ref": "#/$defs/proofObject" },
+                {
+                  "required": ["signer_identity"],
+                  "properties": {
+                    "signer_identity": { "const": "not_established" },
+                    "apw:proof_level": { "not": { "const": "externally_verified" } }
+                  }
+                }
+              ]
+            },
+            "ingredients": {
+              "type": "array",
+              "items": {
+                "allOf": [
+                  { "$ref": "#/$defs/proofObject" },
+                  { "required": ["title", "relationship", "sha256"] }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": true
+}

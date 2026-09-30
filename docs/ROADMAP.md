@@ -18,6 +18,32 @@ The system must distinguish between:
 - externally verified data
 - unknown or unobserved data
 
+## Current Status: v0.9 Demo Candidate
+
+The one-stem automated path now builds a complete JSON manifest and HTML fight
+card from simulated UDP evidence and a detected export. New and overwritten
+exports are covered by integration tests, and the verifier checks the export,
+evidence-prefix bindings, chain commitment, and local integrity seal.
+
+The current VST3 now builds cleanly, is installed, and passes architecture and
+strict Developer ID signing inspection. A live Ableton pass on the demonstration
+machine (2026-08-28, session `capture-20260828T221446Z-9959`) completed rescan,
+insertion, daemon ACK, real-export, coverage, and verification validation with
+`complete_observed_path` coverage and `inferred_match` association. The
+transparency/null test and project save/close/reload were completed live on
+2026-08-29 (sessions `capture-20260830T015947Z-85675` and
+`capture-20260830T021208Z-11629`), closing the v1.0 gate as recorded in
+`docs/VALIDATION.md`.
+
+The demo candidate now also includes deterministic timestamped sessions,
+preflight, bounded daemon-clock correlation, evidence rotation and streaming
+prefix hashing, scoped local daemon acknowledgements, loss/coverage telemetry,
+gain/offset-tolerant routed-feature/export alignment, Ed25519 public-key
+integrity, JSON Schema enforcement, a live dashboard, deterministic signed
+bundle/index, adversarial rehearsal, presenter fallback, and a neutral downstream
+registration handoff. These strengthen the one-stem promise without expanding
+it into full DAW provenance.
+
 ## Agile Epics
 
 ### Epic 1: Capture Plugin
@@ -39,6 +65,7 @@ Goal:
 - Use local UDP for v0.
 - Send non-blocking event messages.
 - Persist received events.
+- Return scoped local operational receipts without touching the audio callback.
 
 ### Epic 3: Export Detection and Hashing
 
@@ -192,8 +219,18 @@ Daemon detects exported WAV or AIFF and hashes it.
 ### v0.5
 Daemon produces first JSON manifest.
 
+### v0.9
+One-stem demo candidate: automated pipeline, fight card, verifier, and build/run
+scripts are ready; manual Ableton validation remains.
+
 ### v1.0
 One-stem end-to-end Ableton demo works reliably.
+
+A manual Ableton host pass on the meeting machine is recorded for 2026-08-28
+(session `capture-20260828T221446Z-9959`). The remaining criteria, the
+transparency/null test and project save/close/reload, were completed live on
+2026-08-29 (`docs/VALIDATION.md`). The v1.0 gate is closed; automated and
+synthetic results were not used to close it.
 
 ### v1.1
 Five-stem workflow works with bypass/failure tests.

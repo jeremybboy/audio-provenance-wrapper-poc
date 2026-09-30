@@ -1,0 +1,9 @@
+[
+  "c_mixed_terminology::AGENTS.md",
+  "dead_code::daemon/hardware_attestation/provider.py",
+  "dead_code::daemon/project_differ/differ.py",
+  "missing_critical_test::tests/test_evidence_receiver.py",
+  "missing_teardown_flush::src/AudioObserver.cpp",
+  "missing_validation::daemon/evidence_receiver/receiver.py",
+  "state_key_collision::src/AudioObserver.cpp"
+]

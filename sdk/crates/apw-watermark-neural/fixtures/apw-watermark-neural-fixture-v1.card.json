@@ -1,0 +1,61 @@
+{
+  "card_format": "apw-watermark-neural-model-card/1",
+  "algorithm_id": "apw-watermark-neural-v1",
+  "model_id": "apw-watermark-neural-fixture-v1",
+  "epoch": 0,
+  "fixture": true,
+  "graphs": {
+    "decoder": {
+      "file": "fixture-decoder-v1.onnx",
+      "sha256": "c628dd79456c427795f6375702d897da43e4a916571e44a46f42693cd1b7c11d"
+    },
+    "encoder": {
+      "file": "fixture-encoder-v1.onnx",
+      "sha256": "b178c450562f5d13fbf678644147bfa56442340cf83b797c52e22c7f3cb5619a"
+    }
+  },
+  "transform": {
+    "sample_rate_hz": 48000,
+    "n_fft": 2048,
+    "hop": 512,
+    "window": "sqrt_hann_periodic",
+    "lead_pad_samples": 2048,
+    "band_bin_low": 9,
+    "band_bin_high": 328,
+    "magnitude": "natural_log",
+    "log_floor": 1e-07,
+    "tensor_layout": "nchw_frequency_major"
+  },
+  "io": {
+    "decoder_input": "log_mag",
+    "decoder_presence_output": "presence_logit",
+    "decoder_message_output": "message_logit",
+    "encoder_log_mag_input": "log_mag",
+    "encoder_message_input": "message",
+    "encoder_output": "gain_raw"
+  },
+  "budget": {
+    "kappa": 0.5,
+    "max_nepers": 0.35
+  },
+  "thresholds": {
+    "presence_accept_score": 0.995,
+    "presence_frame_gate": 0.5,
+    "frame_gate_median_seconds": 0.5,
+    "presence_window_seconds": 10.0,
+    "presence_window_hop_seconds": 5.0,
+    "min_presence_seconds": 10.0,
+    "locator_window_seconds": 30.0,
+    "locator_window_hop_seconds": 15.0,
+    "min_locator_seconds": 20.0,
+    "min_presence_span_seconds": 8.0,
+    "max_windows": 64
+  },
+  "training_provenance": {
+    "corpus": "none: this card describes a hand-written arithmetic graph, not a trained model",
+    "steps": 0,
+    "distortion_layer": "none",
+    "notes": "Plumbing fixture. Emitted by tools/make_fixture_models.py. Carries no learned parameters, encodes nothing, and detects nothing."
+  },
+  "operating_envelope": null
+}

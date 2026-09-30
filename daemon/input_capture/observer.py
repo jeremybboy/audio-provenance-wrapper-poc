@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ class BehavioralAccumulator:
         raise NotImplementedError("Behavioral fingerprint computation not yet implemented")
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Capture OS-level input events while the DAW is focused.",
     )
@@ -155,16 +155,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def platform_support(system: str | None = None) -> dict[str, object]:
+    """Report whether OS-level input capture works on this OS.
+
+    No OS has a capture backend integrated (CGEventTap / evdev / SetWindowsHookEx are
+    not wired), so every platform reports unsupported and nothing is captured.
+    """
+    import platform
+
+    system = system or platform.system() or "unknown"
+    return {
+        "layer": "input_capture",
+        "platform": system,
+        "supported": False,
+        "status": "unsupported_platform",
+        "proof_level": "unknown_unobserved",
+        "reason": f"no OS-level input capture backend is implemented for {system}",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_args(argv or [])
-    observer = InputObserver(
-        target_bundle_id=args.bundle_id,
-        evidence_path=args.evidence_file,
-    )
-    log.info(
-        "Input capture scaffold loaded. CGEventTap integration pending. "
-        "Target: %s",
-        observer.target_bundle_id,
-    )
-    return 0
+    args = parse_args(argv)
+    status = platform_support()
+    log.warning("%s (target %s); nothing will be captured", status["reason"], args.bundle_id)
+    print(json.dumps(status))
+    return 2

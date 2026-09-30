@@ -1,27 +1,39 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
+import signal
 import socket
 import threading
 import time
+import uuid
+from collections import OrderedDict, deque
 from pathlib import Path
 
-from daemon.common import append_jsonl, sha256_file
+from daemon import status as _status
+from daemon.common import append_jsonl, utc_timestamp
 from daemon.correlation_engine.engine import CorrelationEngine, LayerEvent
 from daemon.evidence_receiver.receiver import EvidenceReceiver
-from daemon.hardware_attestation.provider import SoftwareProvider, detect_provider
-from daemon.manifest_builder.builder import (
-    ExportEvidence,
-    IngredientEvidence,
-    ManifestBuilder,
-    StemEvidence,
-)
+from daemon.hardware_attestation.provider import HardwareProvider, SoftwareProvider, detect_provider
+from daemon.manifest_builder import generator as _manifest_generator
+from daemon.provenance import DEFAULT_STORE as DEFAULT_PROVENANCE_STORE
+from daemon.provenance import ProvenanceProvider
+from daemon.provenance import detect_provider as detect_provenance_provider
 from daemon.sample_watcher.watcher import SampleWatcher
+from daemon.signing import DEFAULT_PRIVATE_KEY, DEFAULT_PUBLIC_KEY, Ed25519Signer
+from daemon.time_anchor.anchor import DEFAULT_TSA_URL, RFC3161Provider, TimeAnchorService
+from daemon.time_anchor.ots import DEFAULT_CALENDARS, OtsAnchorService
 
 log = logging.getLogger(__name__)
+
+# Same bound rationale as receiver.MAX_TRACKED_STREAMS: both tables are keyed
+# by wire-controlled values and rendered into the signed manifest.
+MAX_TRACKED_PLUGIN_KEYS = 64
+
+# A sealing failure that cannot succeed (read-only manifest dir, revoked key)
+# otherwise retries every 2s forever behind the DAW window.
+MAX_EXPORT_SEAL_ATTEMPTS = 5
 
 _LAYER_MAP: dict[str, str] = {
     "buffer_hash": "audio_buffer",
@@ -32,6 +44,7 @@ _LAYER_MAP: dict[str, str] = {
     "midi_event": "midi",
     "parameter_change": "midi",
     "session_config_change": "session",
+    "host_environment": "session",
 }
 
 
@@ -43,6 +56,32 @@ DEFAULT_UDP_PORT = 9876
 DEFAULT_EVIDENCE_DIR = Path("evidence")
 DEFAULT_SAMPLE_DIR = Path("~/Music/ProvenanceSamples")
 DEFAULT_MANIFEST_DIR = Path("manifests")
+DEFAULT_SIGNING_KEY = Path("~/.apw/demo_signing_key.bin")
+SOURCE_CATEGORIES = (
+    "unknown",
+    "audio_interface_recording",
+    "midi_vst_synth",
+    "imported_sample",
+    "generator",
+    "resampling",
+    "manual_import",
+)
+
+
+class DaemonStartupError(RuntimeError):
+    """A startup precondition failed with an operator-actionable explanation."""
+
+
+def _prepare_directory(path: Path, flag: str) -> Path:
+    path = path.expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DaemonStartupError(
+            f"Cannot create the {flag} directory {path}: {exc}. "
+            f"Start the daemon from a writable directory, or pass {flag} <writable path>."
+        ) from exc
+    return path
 
 
 class Daemon:
@@ -56,16 +95,57 @@ class Daemon:
         project_path: Path | None = None,
         export_dir: Path | None = None,
         manifest_dir: Path = DEFAULT_MANIFEST_DIR,
+        session_id: str | None = None,
+        stem_id: str = "stem-1",
+        source_category: str = "unknown",
+        signing_key_path: Path = DEFAULT_SIGNING_KEY,
+        portable_private_key_path: Path = DEFAULT_PRIVATE_KEY,
+        portable_public_key_path: Path = DEFAULT_PUBLIC_KEY,
+        hardware_provider: HardwareProvider | None = None,
+        provenance_provider: ProvenanceProvider | None = None,
+        provenance_store: Path = DEFAULT_PROVENANCE_STORE,
+        generate_html_report: bool = True,
+        open_artifacts: bool = False,
+        time_anchor_url: str | None = None,
+        ots_calendars: list[str] | None = None,
+        sdk_adapter_enabled: bool = False,
+        sdk_cli: str = "audio-provenance",
+        sdk_development_key: Path = Path("~/.apw/sdk_development.key"),
+        sdk_registry: str | None = None,
     ) -> None:
-        self.evidence_dir = evidence_dir.expanduser()
-        self.manifest_dir = manifest_dir.expanduser()
-        self.evidence_dir.mkdir(parents=True, exist_ok=True)
-        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        if source_category not in SOURCE_CATEGORIES:
+            raise ValueError(f"Unsupported source category: {source_category}")
+
+        self.evidence_dir = _prepare_directory(evidence_dir, "--evidence-dir")
+        self.manifest_dir = _prepare_directory(manifest_dir, "--manifest-dir")
+        self._provenance_store = Path(provenance_store).expanduser()
+
+        self.session_id = session_id or (
+            f"capture-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+        )
+        self.stem_id = stem_id
+        self.source_category = source_category
+        self.source_category_proof_level = (
+            "unknown_unobserved" if source_category == "unknown" else "user_declared"
+        )
+        self.generate_html_report = generate_html_report
+        self.open_artifacts = open_artifacts
+        self.sdk_adapter_enabled = sdk_adapter_enabled
+        self.sdk_cli = sdk_cli
+        self.sdk_development_key = sdk_development_key.expanduser()
+        self.sdk_registry = sdk_registry
+        self._time_anchor = (
+            TimeAnchorService(RFC3161Provider(time_anchor_url)) if time_anchor_url else None
+        )
+        # None disables OpenTimestamps; an empty list selects the default calendars.
+        self._ots_anchor = OtsAnchorService(ots_calendars) if ots_calendars is not None else None
 
         self.receiver = EvidenceReceiver(
             host="127.0.0.1",
             port=udp_port,
             evidence_path=self.evidence_dir / "plugin_events.jsonl",
+            capture_session_id=self.session_id,
+            stem_id=self.stem_id,
         )
 
         self.correlation = CorrelationEngine(
@@ -80,25 +160,183 @@ class Daemon:
         )
 
         self.project_path = project_path
-        self.export_dir = export_dir.expanduser() if export_dir else None
-        self._export_seen: set[str] = set()
+        self.export_dir = (
+            _prepare_directory(export_dir, "--export-dir") if export_dir else None
+        )
+        self._export_seen: dict[str, tuple[int, int]] = {}
         self._session_lock = threading.Lock()
-        self._session_events: list[dict[str, object]] = []
-        self._active_layers: set[str] = {"audio_buffer", "sample_watcher"}
+        self._session_events: deque[dict[str, object]] = deque()
+        self._max_session_events = 50_000
+        self._session_event_drops = 0
+        self._feature_events: deque[dict[str, object]] = deque(maxlen=12_000)
+        self._feature_window_drops = 0
+        self._buffer_hash_count = 0
+        self._first_hash_event: dict[str, object] | None = None
+        self._last_hash_event: dict[str, object] | None = None
+        # IMPORTANT: first observation wins and a disagreeing IDENTITY collapses
+        # the record to unobserved. The plug-in re-emits this every prepareToPlay
+        # and the UDP socket cannot authenticate its sender, so last-wins would let
+        # a spoofed datagram rename the host in a signed manifest. Held here rather
+        # than read back from _session_events because the constructor's emission is
+        # event #1 and therefore the first thing popleft discards.
+        self._host_environment: dict[str, object] | None = None
+        self._host_environment_conflicts = 0
+        # Bounded like receiver._stream_states: both are keyed by wire-controlled
+        # values and exported into the signed manifest, so unbounded growth is a
+        # local-DoS and manifest-spam vector. OrderedDict keys act as an LRU set.
+        self._plugin_instance_ids: OrderedDict[str, None] = OrderedDict()
+        self._latest_plugin_telemetry: OrderedDict[str, int] = OrderedDict()
+        self._telemetry_regressions = 0
+        self._export_versions: dict[str, int] = {}
+        self._export_failures: dict[str, tuple[tuple[int, int] | None, int]] = {}
+        self._last_manifest_error: str | None = None
+        self._last_association_status: str | None = None
+        self._last_manifest_path: Path | None = None
+        self._last_report_path: Path | None = None
+        self._last_verification_path: Path | None = None
+        self._last_handoff_path: Path | None = None
+        self._last_bundle_index_path: Path | None = None
+        self._last_bundle_path: Path | None = None
+        self._last_verifier_outcome: str | None = None
+        self._last_export_path: Path | None = None
+        self._last_sdk_receipt_path: Path | None = None
+        self._last_sdk_record_id: str | None = None
+        self._last_sdk_verification_status: str | None = None
+        self._last_sdk_error: str | None = None
+        self._status_path = self.evidence_dir.parent / "status.json"
+        self._session_started_at = utc_timestamp()
+        self._active_layers: set[str] = {"sample_watcher"}
         self._latest_project_snapshot = None
+        self._plugin_seen = False
+        self._last_plugin_event_monotonic = 0.0
         self._stop = threading.Event()
+        self._portable_signer = Ed25519Signer(
+            portable_private_key_path,
+            portable_public_key_path,
+        )
 
-        try:
-            self._hw_provider = detect_provider()
-        except Exception:
-            log.warning("Hardware provider detection failed; using software fallback", exc_info=True)
-            self._hw_provider = SoftwareProvider(
-                key_path=Path("~/.apw/device_key.bin")
-            )
+        if hardware_provider is not None:
+            self._hw_provider = hardware_provider
+        else:
+            try:
+                self._hw_provider = detect_provider(signing_key_path)
+            except Exception:
+                log.warning("Signer detection failed; using software fallback", exc_info=True)
+                self._hw_provider = SoftwareProvider(key_path=signing_key_path)
+        if provenance_provider is not None:
+            self._provenance_provider = provenance_provider
+        else:
+            try:
+                self._provenance_provider = detect_provenance_provider(provenance_store)
+            except Exception:
+                # A manifest without a C2PA claim is honest; a daemon that cannot
+                # start because key custody failed is not.
+                log.warning(
+                    "Provenance provider unavailable; manifests will record no C2PA claim",
+                    exc_info=True,
+                )
+                self._provenance_provider = None
+        # The post-write verification must use the key that actually sealed the
+        # manifest. An injected provider carries its own path, and reading the
+        # CLI default instead reported a valid manifest as signer_mismatch.
+        self._signing_key_path = (
+            self._hw_provider.key_path
+            if isinstance(self._hw_provider, SoftwareProvider)
+            else signing_key_path.expanduser()
+        )
+        # Cosignature chain across this device's manifests (CPoE pattern): each
+        # manifest_signature.hardware_cosignature entangles this hash. Resumed
+        # from the provider so a restart continues the chain instead of silently
+        # restarting it at genesis, which is indistinguishable from a replay.
+        self._last_cosignature_hash = self._hw_provider.last_cosignature_hash()
 
     def _append_event(self, event: dict[str, object]) -> None:
         with self._session_lock:
+            if len(self._session_events) >= self._max_session_events:
+                self._session_events.popleft()
+                self._session_event_drops += 1
+                if self._session_event_drops == 1 or self._session_event_drops % 10_000 == 0:
+                    log.warning(
+                        "Session event memory limit reached; dropped=%d max=%d",
+                        self._session_event_drops,
+                        self._max_session_events,
+                    )
             self._session_events.append(event)
+
+    def _record_plugin_event(self, event: dict[str, object], layer: str) -> None:
+        self._append_event(event)
+        with self._session_lock:
+            self._active_layers.add(layer)
+            instance_id = str(event.get("plugin_instance_id", "unknown_plugin_instance"))
+            self._plugin_instance_ids[instance_id] = None
+            self._plugin_instance_ids.move_to_end(instance_id)
+            while len(self._plugin_instance_ids) > MAX_TRACKED_PLUGIN_KEYS:
+                evicted, _ = self._plugin_instance_ids.popitem(last=False)
+                log.warning("Plugin instance table full; evicted least-recent id %s", evicted)
+            telemetry = event.get("telemetry")
+            if isinstance(telemetry, dict):
+                # IMPORTANT: the UDP socket cannot authenticate its sender and the
+                # plug-in broadcasts its instance id in cleartext, so a spoofed
+                # datagram reusing that id could otherwise reset fifo_samples_dropped
+                # to 0 and upgrade a lossy session to complete_observed_path. These
+                # are cumulative counters: a value below the last accepted one is
+                # either a spoof or a restarted instance, and neither may lower the
+                # recorded loss.
+                for key, value in telemetry.items():
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        continue
+                    name = str(key)
+                    previous = self._latest_plugin_telemetry.get(name)
+                    if previous is not None and value < previous:
+                        self._telemetry_regressions += 1
+                        log.warning(
+                            "Plug-in telemetry counter %s went backwards (%d -> %d); "
+                            "ignoring the lower value and grading coverage as partial",
+                            name, previous, value,
+                        )
+                        continue
+                    self._latest_plugin_telemetry[name] = value
+                    self._latest_plugin_telemetry.move_to_end(name)
+                while len(self._latest_plugin_telemetry) > MAX_TRACKED_PLUGIN_KEYS:
+                    self._latest_plugin_telemetry.popitem(last=False)
+            if event.get("event_type") == "host_environment":
+                self._record_host_environment(event)
+            if event.get("event_type") == "buffer_hash":
+                self._buffer_hash_count += 1
+                if self._first_hash_event is None:
+                    self._first_hash_event = dict(event)
+                self._last_hash_event = dict(event)
+                if len(self._feature_events) == self._feature_events.maxlen:
+                    self._feature_window_drops += 1
+                self._feature_events.append(dict(event))
+
+    def _record_host_environment(self, event: dict[str, object]) -> None:
+        """Hold the first host environment and mark any later identity disagreement.
+
+        IMPORTANT: only recognition and name are compared. One host routinely loads
+        the plug-in in two formats at once (VST3 alongside AU while a producer A/Bs
+        them), and treating that as two hosts would withdraw a name that was never
+        in doubt.
+
+        Caller holds _session_lock.
+        """
+        observed = {
+            "host_recognised": bool(event.get("host_recognised")),
+            "host_name": event.get("host_name") or None,
+            "host_executable_name": event.get("host_executable_name") or None,
+            "wrapper_format": event.get("wrapper_format") or None,
+        }
+        if self._host_environment is None:
+            self._host_environment = observed
+            return
+        identity = ("host_recognised", "host_name")
+        if any(observed[key] != self._host_environment[key] for key in identity):
+            self._host_environment_conflicts += 1
+            log.warning(
+                "Host environment reported as %r after %r; the manifest will record "
+                "the host as unobserved",
+                observed, self._host_environment,
+            )
 
     def _correlate(self, layer_event: LayerEvent) -> None:
         try:
@@ -117,26 +355,73 @@ class Daemon:
         ]
 
         if self.project_path and self.project_path.exists():
-            self._active_layers.add("project_differ")
             threads.append(
                 threading.Thread(target=self._run_project_watcher, name="project-watcher", daemon=True)
             )
+        elif self.project_path:
+            log.warning("Project watcher disabled because the file does not exist: %s", self.project_path)
 
         if self.export_dir:
             threads.append(
                 threading.Thread(target=self._run_export_watcher, name="export-watcher", daemon=True)
             )
 
+        log.info("Capture session: %s", self.session_id)
+        log.info("Declared source category: %s (%s)", self.source_category, self.source_category_proof_level)
         log.info("Daemon starting with %d threads", len(threads))
+        self._write_evidence("session_events.jsonl", {
+            "event_type": "session_start",
+            "capture_session_id": self.session_id,
+            "stem_id": self.stem_id,
+            "started_at": self._session_started_at,
+            "daemon_monotonic_ms": int(time.monotonic_ns() // 1_000_000),
+            "proof_level": "directly_observed",
+        })
+        self._write_status("idle")
         for t in threads:
             t.start()
 
         try:
             while not self._stop.is_set():
                 self._stop.wait(1.0)
+                recently_active = (
+                    self._plugin_seen
+                    and time.monotonic() - self._last_plugin_event_monotonic < 3.0
+                )
+                # Worker loops all degrade on exceptions; the main loop must not
+                # be the one thread a bad status write can kill.
+                try:
+                    self._write_status("active" if recently_active else "idle")
+                except Exception:
+                    log.exception("Status write failed; daemon continues")
         except KeyboardInterrupt:
             log.info("Shutting down")
             self._stop.set()
+        finally:
+            self._stop.set()
+            self.receiver.close()
+            # IMPORTANT: workers write evidence/status/manifests; join them before
+            # the session_end record so nothing lands after status says "stopped".
+            for t in threads:
+                t.join(timeout=10.0)
+                if t.is_alive():
+                    log.warning("Worker thread %s did not stop within 10s", t.name)
+            self._write_evidence("session_events.jsonl", {
+                "event_type": "session_end",
+                "capture_session_id": self.session_id,
+                "ended_at": utc_timestamp(),
+                "daemon_monotonic_ms": int(time.monotonic_ns() // 1_000_000),
+                "proof_level": "directly_observed",
+                "diagnostics": self.receiver.diagnostics(),
+            })
+            try:
+                self._write_status("stopped")
+            except Exception:
+                log.exception("Final status write failed")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.receiver.close()
 
     def _run_udp_receiver(self) -> None:
         log.info("UDP receiver on port %d", self.receiver.port)
@@ -144,7 +429,7 @@ class Daemon:
 
         while not self._stop.is_set():
             try:
-                data, _addr = self.receiver.sock.recvfrom(65535)
+                data, address = self.receiver.sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError:
@@ -153,21 +438,35 @@ class Daemon:
                 log.exception("UDP socket error")
                 continue
 
-            event = self.receiver.process_packet(data)
-            if event is None:
-                continue
+            try:
+                event, acknowledgement = self.receiver.process_packet_with_ack(data)
+                if not self.receiver.send_acknowledgement(address, acknowledgement):
+                    log.warning(
+                        "Could not dispatch local daemon acknowledgement to %s:%d",
+                        address[0],
+                        address[1],
+                    )
+                if event is None:
+                    continue
+                self._last_plugin_event_monotonic = time.monotonic()
 
-            self._append_event(event)
-
-            et = str(event.get("event_type", ""))
-            layer = _event_type_to_layer(et)
-            layer_event = LayerEvent(
-                layer=layer,
-                event_type=et,
-                timestamp_ms=int(event.get("timestamp_ms", 0)),
-                data=event,
-            )
-            self._correlate(layer_event)
+                et = str(event.get("event_type", ""))
+                layer = _event_type_to_layer(et)
+                self._record_plugin_event(event, layer)
+                if not self._plugin_seen:
+                    self._plugin_seen = True
+                    log.info("Capture plugin evidence stream detected")
+                layer_event = LayerEvent(
+                    layer=layer,
+                    event_type=et,
+                    timestamp_ms=int(event.get("daemon_received_monotonic_ms", 0)),
+                    data=event,
+                )
+                self._correlate(layer_event)
+            except Exception:
+                # One bad datagram must degrade, not kill the receiver thread,
+                # matching the sample/project/export worker-loop pattern.
+                log.exception("UDP packet processing error")
 
     def _run_sample_watcher(self) -> None:
         self.sample_watcher.mark_existing_seen()
@@ -178,25 +477,42 @@ class Daemon:
                 events = self.sample_watcher.scan_once()
             except Exception:
                 log.exception("Sample watcher error")
-                time.sleep(self.sample_watcher.poll_interval_seconds)
+                self._stop.wait(self.sample_watcher.poll_interval_seconds)
                 continue
 
             for event in events:
                 log.info("Sample detected: %s", event.get("file_name"))
+                event["source_timestamp"] = event.get("observed_at")
+                event["daemon_observed_monotonic_ms"] = int(time.monotonic_ns() // 1_000_000)
                 self._append_event(event)
 
                 layer_event = LayerEvent(
                     layer="sample_watcher",
                     event_type="sample_file_observed",
-                    timestamp_ms=int(time.time() * 1000),
+                    timestamp_ms=int(event["daemon_observed_monotonic_ms"]),
                     data=event,
                 )
                 self._correlate(layer_event)
 
-            time.sleep(self.sample_watcher.poll_interval_seconds)
+            self._stop.wait(self.sample_watcher.poll_interval_seconds)
 
     def _run_project_watcher(self) -> None:
-        from daemon.project_differ.differ import extract_snapshot, compute_diff
+        from daemon.project_differ.differ import compute_diff, diff_to_event
+        from daemon.project_formats import (
+            UnsupportedProjectFormat,
+            detect_format,
+            parse_project,
+            unsupported_format_event,
+        )
+
+        project_format = detect_format(self.project_path)
+        if project_format is not None and not project_format.supported:
+            log.warning("%s", UnsupportedProjectFormat(project_format, self.project_path))
+            self._write_evidence(
+                "project_diff_events.jsonl",
+                unsupported_format_event(project_format, self.project_path),
+            )
+            return
 
         log.info("Project watcher on %s", self.project_path)
         prev_snapshot = None
@@ -206,44 +522,34 @@ class Daemon:
             try:
                 stat = self.project_path.stat()
             except OSError:
-                time.sleep(2.0)
+                self._stop.wait(2.0)
                 continue
 
             if stat.st_mtime_ns != prev_mtime_ns:
                 prev_mtime_ns = stat.st_mtime_ns
                 try:
-                    snapshot = extract_snapshot(self.project_path)
+                    snapshot = parse_project(self.project_path)
                 except Exception:
                     log.exception("Failed to parse %s", self.project_path)
-                    time.sleep(2.0)
+                    self._stop.wait(2.0)
                     continue
+
+                with self._session_lock:
+                    self._active_layers.add("project_differ")
 
                 if prev_snapshot is not None:
                     diff = compute_diff(prev_snapshot, snapshot)
                     if diff.has_changes():
-                        diff_event: dict[str, object] = {
-                            "event_type": "project_diff",
-                            "proof_level": "directly_observed",
-                            "timestamp_ms": int(time.time() * 1000),
-                            "clips_added": diff.clips_added,
-                            "clips_removed": diff.clips_removed,
-                            "clips_modified": diff.clips_modified,
-                            "tracks_added": diff.tracks_added,
-                            "tracks_removed": diff.tracks_removed,
-                            "devices_changed": diff.devices_changed,
-                            "samples_added": sorted(diff.samples_added),
-                            "samples_removed": sorted(diff.samples_removed),
-                            "midi_notes_delta": diff.midi_notes_delta,
-                            "automation_points_delta": diff.automation_points_delta,
-                            "bpm_changed": diff.bpm_changed,
-                        }
+                        diff_event = diff_to_event(diff)
+                        if snapshot.project_format != "ableton_als":
+                            diff_event["project_format"] = snapshot.project_format
                         self._write_evidence("project_diff_events.jsonl", diff_event)
                         self._append_event(diff_event)
 
                         layer_event = LayerEvent(
                             layer="project_differ",
                             event_type="project_diff",
-                            timestamp_ms=int(time.time() * 1000),
+                            timestamp_ms=int(diff_event["daemon_observed_monotonic_ms"]),
                             data=diff_event,
                         )
                         self._correlate(layer_event)
@@ -255,15 +561,21 @@ class Daemon:
                 prev_snapshot = snapshot
                 self._latest_project_snapshot = snapshot
 
-            time.sleep(2.0)
+            self._stop.wait(2.0)
 
     def _run_export_watcher(self) -> None:
         log.info("Export watcher on %s", self.export_dir)
         AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif"}
 
-        for existing in self.export_dir.iterdir():
-            if existing.is_file() and existing.suffix.lower() in AUDIO_EXTENSIONS:
-                self._export_seen.add(str(existing.resolve()))
+        try:
+            for existing in self.export_dir.iterdir():
+                if existing.is_file() and existing.suffix.lower() in AUDIO_EXTENSIONS:
+                    try:
+                        self._export_seen[str(existing.resolve())] = self._export_signature(existing)
+                    except OSError:
+                        continue
+        except OSError:
+            log.exception("Export watcher could not scan %s at startup", self.export_dir)
 
         while not self._stop.is_set():
             try:
@@ -274,197 +586,297 @@ class Daemon:
                         continue
 
                     resolved = str(path.resolve())
-                    if resolved in self._export_seen:
+                    try:
+                        signature = self._export_signature(path)
+                    except OSError:
+                        continue
+                    if self._export_seen.get(resolved) == signature:
                         continue
 
                     if not self._file_is_stable(path):
                         continue
 
-                    self._export_seen.add(resolved)
-                    log.info("Export detected: %s", path.name)
-                    self._generate_manifest(path)
+                    # Keyed by the bytes that failed: once the operator fixes the
+                    # cause and re-renders, the file must be sealed again rather
+                    # than stay silently skipped for the life of the process.
+                    failed_signature, attempts = self._export_failures.get(resolved, (None, 0))
+                    if failed_signature != signature:
+                        attempts = 0
+                        self._export_failures.pop(resolved, None)
+                    elif attempts >= MAX_EXPORT_SEAL_ATTEMPTS:
+                        continue
+
+                    try:
+                        log.info("Export detected: %s", path.name)
+                        version = self._next_export_version(path, resolved)
+                        self._generate_manifest(path, export_version=version)
+                        self._export_versions[resolved] = version
+                        self._export_seen[resolved] = self._export_signature(path)
+                        self._export_failures.pop(resolved, None)
+                        self._last_manifest_error = None
+                        self._mark_superseded(path, version)
+                    except Exception as exc:
+                        attempts += 1
+                        self._export_failures[resolved] = (signature, attempts)
+                        self._last_manifest_error = (
+                            f"{path.name}: {type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+                        )
+                        log.exception(
+                            "Manifest generation failed for %s (attempt %d of %d)",
+                            path, attempts, MAX_EXPORT_SEAL_ATTEMPTS,
+                        )
+                        if attempts >= MAX_EXPORT_SEAL_ATTEMPTS:
+                            log.error(
+                                "Giving up on %s after %d attempts; no manifest, fight card or "
+                                "evidence bundle will be produced for it",
+                                path, attempts,
+                            )
+                        try:
+                            self._write_status("error")
+                        except Exception:
+                            log.exception("Status write failed while reporting a sealing failure")
             except OSError:
-                pass
+                log.exception("Export watcher could not scan %s", self.export_dir)
 
-            time.sleep(2.0)
+            self._stop.wait(2.0)
 
-    def _generate_manifest(self, export_path: Path) -> None:
-        export_hash = sha256_file(export_path)
-        stat = export_path.stat()
-        builder = ManifestBuilder(
-            session_id=f"session-{int(time.time())}",
+    @staticmethod
+    def manifest_suffix(export_version: int) -> str:
+        return "" if export_version == 1 else f"_v{export_version:03d}"
+
+    def _manifest_path_for(self, export_path: Path, export_version: int) -> Path:
+        return self.manifest_dir / (
+            f"{export_path.stem}{self.manifest_suffix(export_version)}_manifest.json"
         )
-        builder.set_export(ExportEvidence(
-            file_path=str(export_path),
-            file_name=export_path.name,
-            sha256=export_hash,
-            format=export_path.suffix.lower().lstrip("."),
-            file_size_bytes=stat.st_size,
-            duration_seconds=None,
-            exported_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        ))
 
-        first_hash_ms = 0
-        last_hash_ms = 0
-        last_window_hash = ""
-        chain_root = ""
-        chain_length = 0
-        stem_sr = 0
-        stem_ch = 0
+    def _next_export_version(self, export_path: Path, resolved: str) -> int:
+        """Choose a version whose artifact set is not already on disk.
 
-        with self._session_lock:
-            events_snapshot = list(self._session_events)
+        _export_versions is per-process, so after a restart the same re-export
+        recomputed version 1 and clobbered the previous run's manifest, fight
+        card, evidence bundle and signed C2PA asset with no warning.
+        """
+        version = self._export_versions.get(resolved, 0) + 1
+        while self._manifest_path_for(export_path, version).exists():
+            version += 1
+        return version
 
-        for event in events_snapshot:
-            et = event.get("event_type")
-            if et == "buffer_hash":
-                chain_length += 1
-                ts = int(event.get("timestamp_ms", 0))
-                if chain_length == 1:
-                    first_hash_ms = ts
-                    chain_root = str(event.get("prev_hash", "genesis"))
-                last_hash_ms = ts
-                last_window_hash = str(event.get("window_hash", ""))
-                stem_sr = int(event.get("sample_rate_hz", stem_sr))
-                stem_ch = int(event.get("channel_count", stem_ch))
-            elif et == "sample_file_observed":
-                builder.add_ingredient(IngredientEvidence(
-                    file_name=str(event.get("file_name", "")),
-                    sha256=str(event.get("sha256", "")),
-                    proof_level=str(event.get("proof_level", "directly_observed")),
-                    correlation_confidence=None,
-                    audio_fingerprint=event.get("audio_fingerprint"),
-                ))
-            elif et == "composite_edit":
-                builder.add_composite_edit(event)
+    def _mark_superseded(self, export_path: Path, export_version: int) -> None:
+        """Record that an earlier manifest describes bytes this file no longer has.
 
-        if chain_length > 0:
-            builder.add_stem(StemEvidence(
-                stem_id="stem-1",
-                hash_chain_root=chain_root,
-                hash_chain_length=chain_length,
-                first_observed_ms=first_hash_ms,
-                last_observed_ms=last_hash_ms,
-                sample_rate_hz=stem_sr,
-                channel_count=stem_ch,
-                source_category="unknown",
-                proof_level="directly_observed",
-            ))
+        The DAW overwrites the audio in place while the manifest is versioned, so
+        the earlier, still-complete artifact set verifies as changed on an
+        untampered session unless the verifier can say why.
+        """
+        if export_version <= 1:
+            return
+        newer = self._manifest_path_for(export_path, export_version).name
+        for earlier in range(1, export_version):
+            manifest_path = self._manifest_path_for(export_path, earlier)
+            if not manifest_path.is_file():
+                continue
+            marker = manifest_path.with_name(manifest_path.stem + ".superseded.json")
+            try:
+                marker.write_text(
+                    json.dumps({
+                        "superseded_by": newer,
+                        "at": utc_timestamp(),
+                        "reason": "the export was re-rendered under the same file name",
+                    }, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                log.warning("Could not record supersession beside %s", manifest_path, exc_info=True)
 
-        all_layers = {"audio_buffer", "transport", "midi", "session",
-                      "sample_watcher", "project_differ", "input_capture",
-                      "screen_observer"}
-        missing_layers = sorted(all_layers - self._active_layers)
-        builder.unobserved = list(builder.unobserved)
-        for layer in missing_layers:
-            builder.unobserved.append(f"layer_{layer}_not_active")
+    def _generate_manifest(self, export_path: Path, export_version: int = 1) -> Path:
+        return _manifest_generator.generate_manifest(self, export_path, export_version)
 
-        evidence_hashes: dict[str, str] = {}
-        for evidence_file in self.evidence_dir.glob("*.jsonl"):
-            h = hashlib.sha256()
-            h.update(evidence_file.read_bytes())
-            evidence_hashes[evidence_file.name] = h.hexdigest()
+    def _derive_coverage(self, chain_length: int) -> dict[str, object]:
+        return _manifest_generator.derive_coverage(self, chain_length)
 
-        manifest = builder.build()
+    def _derive_host_environment(self) -> dict[str, object]:
+        return _manifest_generator.derive_host_environment(self)
 
-        snap = self._latest_project_snapshot
-        if snap is not None:
-            manifest["session_facts"] = {
-                "bpm": snap.transport_bpm,
-                "time_signature": f"{snap.transport_time_signature[0]}/{snap.transport_time_signature[1]}",
-                "loop_on": snap.transport_loop_on,
-                "track_count": snap.track_count,
-                "clip_count": snap.clip_count,
-                "sample_refs": sorted(snap.sample_refs),
-                "tracks": [
-                    {
-                        "name": t.name,
-                        "type": t.track_type,
-                        "devices": list(t.devices),
-                        "device_presets": list(t.device_presets),
-                        "sample_paths": list(t.sample_paths),
-                        "clips": [
-                            {
-                                "name": c.name,
-                                "position_beats": c.position_beats,
-                                "length_beats": c.length_beats,
-                                "sample_ref": c.sample_ref,
-                                "warp_on": c.warp_on,
-                                "is_midi": c.is_midi,
-                            }
-                            for c in t.clips
-                        ],
-                        "clip_count": t.clip_count,
-                        "midi_note_count": t.midi_note_count,
-                        "automation_point_count": t.automation_point_count,
-                        "routing_input": t.routing_input,
-                        "routing_output": t.routing_output,
-                        "sends": [{"target": s.target, "level": s.level} for s in t.sends],
-                        "group_id": t.group_id,
-                        "is_frozen": t.is_frozen,
-                        "color_index": t.color_index,
-                    }
-                    for t in snap.tracks
-                ],
-            }
-        manifest["evidence_binding"] = {
-            "evidence_file_hashes": evidence_hashes,
-            "last_window_hash": last_window_hash,
-            "chain_length": chain_length,
-        }
+    def _derive_forgery_analysis(self, events_snapshot: list[dict[str, object]]) -> dict[str, object]:
+        return _manifest_generator.derive_forgery_analysis(events_snapshot)
 
-        try:
-            identity = self._hw_provider.device_identity()
-            manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-            signature = self._hw_provider.sign(manifest_bytes)
-            manifest["manifest_signature"] = {
-                "algorithm": identity.algorithm,
-                "device_id": identity.device_id,
-                "public_key_hex": identity.public_key_hex,
-                "signature_hex": signature.hex(),
-                "signed_content_hash": hashlib.sha256(manifest_bytes).hexdigest(),
-            }
-        except Exception:
-            log.warning("Could not sign manifest", exc_info=True)
+    def _derive_readiness(self, state: str | None = None) -> dict[str, object]:
+        return _status.derive_readiness(self, state)
 
-        manifest_path = self.manifest_dir / f"{export_path.stem}_manifest.json"
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        with manifest_path.open("w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        log.info("Manifest written: %s", manifest_path)
+    def _session_diagnostics(self) -> dict[str, object]:
+        return _status.session_diagnostics(self)
+
+    def _build_handoff(
+        self,
+        *,
+        export_hash: str,
+        association: dict[str, object],
+        coverage: dict[str, object] | None,
+        evidence_files: dict[str, dict[str, object]],
+        manifest_name: str,
+        bundle_name: str | None,
+        bundle_index_name: str | None,
+        c2pa_claim: dict[str, object] | None = None,
+        chain_root: str | None = None,
+        chain_length: int = 0,
+    ) -> dict[str, object]:
+        return _status.build_handoff(
+            self,
+            export_hash=export_hash,
+            association=association,
+            coverage=coverage,
+            evidence_files=evidence_files,
+            manifest_name=manifest_name,
+            bundle_name=bundle_name,
+            bundle_index_name=bundle_index_name,
+            c2pa_claim=c2pa_claim,
+            chain_root=chain_root,
+            chain_length=chain_length,
+        )
+
+    def _status_link(self, path: Path | None) -> str | None:
+        return _status.status_link(path, self._status_path.parent)
+
+    def _write_status(self, state: str) -> None:
+        _status.write_status(self, state)
 
     @staticmethod
     def _file_is_stable(path: Path, checks: int = 3, interval: float = 0.5) -> bool:
         try:
-            prev_size = path.stat().st_size
+            previous = Daemon._export_signature(path)
         except OSError:
             return False
         for _ in range(checks):
             time.sleep(interval)
             try:
-                cur_size = path.stat().st_size
+                current = Daemon._export_signature(path)
             except OSError:
                 return False
-            if cur_size != prev_size:
+            if current != previous:
                 return False
-            prev_size = cur_size
-        return prev_size > 0
+            previous = current
+        return previous[0] > 0
+
+    @staticmethod
+    def _export_signature(path: Path) -> tuple[int, int]:
+        stat = path.stat()
+        return stat.st_size, stat.st_mtime_ns
 
     def _write_evidence(self, filename: str, event: dict[str, object]) -> None:
         append_jsonl(self.evidence_dir / filename, event)
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Audio provenance daemon: receives plugin events, watches files, generates manifests.",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_UDP_PORT, help="UDP port for plugin events.")
     parser.add_argument("--evidence-dir", type=Path, default=DEFAULT_EVIDENCE_DIR, help="Evidence output directory.")
     parser.add_argument("--sample-dir", type=Path, default=DEFAULT_SAMPLE_DIR, help="Sample watch directory.")
-    parser.add_argument("--project", type=Path, default=None, help="Ableton .als project file to watch.")
+    parser.add_argument("--project", type=Path, default=None, help="Project file to watch (.als or .rpp; other hosts are recorded as unsupported).")
     parser.add_argument("--export-dir", type=Path, default=None, help="Export directory to watch for WAV/AIFF.")
     parser.add_argument("--manifest-dir", type=Path, default=DEFAULT_MANIFEST_DIR, help="Manifest output directory.")
+    parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional local capture-session identifier. A unique value is generated by default.",
+    )
+    parser.add_argument("--stem-id", default="stem-1", help="Identifier for the single routed stem.")
+    parser.add_argument(
+        "--time-anchor",
+        nargs="?",
+        const=DEFAULT_TSA_URL,
+        default=None,
+        metavar="TSA_URL",
+        help=(
+            "Anchor each export hash at an RFC 3161 TSA (default server if no URL given). "
+            "Requires network access at manifest-sealing time; degrades to an explicit "
+            "unavailable record on failure."
+        ),
+    )
+    parser.add_argument(
+        "--ots",
+        action="store_true",
+        help=(
+            "Also submit each export hash to OpenTimestamps calendars (default: "
+            + ", ".join(DEFAULT_CALENDARS)
+            + "). The record is 'pending': it asserts no time until the proof is upgraded."
+        ),
+    )
+    parser.add_argument(
+        "--ots-calendar",
+        action="append",
+        default=None,
+        metavar="URL",
+        help="An OpenTimestamps calendar URL (repeatable); implies --ots and replaces the defaults.",
+    )
+    parser.add_argument(
+        "--source-category",
+        choices=SOURCE_CATEGORIES,
+        default="unknown",
+        help="Producer-declared source category. Defaults to unknown.",
+    )
+    parser.add_argument(
+        "--signing-key",
+        type=Path,
+        default=DEFAULT_SIGNING_KEY,
+        help="Local software integrity-key path. This is not hardware attestation.",
+    )
+    parser.add_argument(
+        "--portable-private-key",
+        type=Path,
+        default=DEFAULT_PRIVATE_KEY,
+        help="Ed25519 private key for demo integrity signing.",
+    )
+    parser.add_argument(
+        "--portable-public-key",
+        type=Path,
+        default=DEFAULT_PUBLIC_KEY,
+        help="Portable Ed25519 public key written for independent verification.",
+    )
+    parser.add_argument(
+        "--provenance-store",
+        type=Path,
+        default=DEFAULT_PROVENANCE_STORE,
+        help=(
+            "Local provenance key-custody store used to sign the C2PA claim. "
+            "The chain issued here is self-asserted, not an externally verified identity."
+        ),
+    )
+    parser.add_argument(
+        "--no-html-report",
+        action="store_true",
+        help="Generate only the JSON manifest, without the derived HTML fight card.",
+    )
+    parser.add_argument(
+        "--open-artifacts",
+        action="store_true",
+        help="Open each generated fight card with the macOS default browser.",
+    )
+    parser.add_argument(
+        "--sdk-adapter",
+        action="store_true",
+        help=(
+            "After an export is sealed, convert its signed handoff through the Rust SDK, write a "
+            "development-only sidecar/receipt, and verify it with the public SDK API."
+        ),
+    )
+    parser.add_argument(
+        "--sdk-cli",
+        default="audio-provenance",
+        help="Path to the Rust audio-provenance CLI used by --sdk-adapter.",
+    )
+    parser.add_argument(
+        "--sdk-development-key",
+        type=Path,
+        default=Path("~/.apw/sdk_development.key"),
+        help="Retry-stable 32-byte development key; created with mode 0600 if absent.",
+    )
+    parser.add_argument(
+        "--sdk-registry",
+        default=None,
+        help="Optional configured local SDK registry name for development publication.",
+    )
     return parser.parse_args(argv)
 
 
@@ -474,17 +886,41 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-    args = parse_args(argv or [])
-    daemon = Daemon(
+    args = parse_args(argv)
+    try:
+        daemon = _build_daemon(args)
+    except DaemonStartupError as exc:
+        log.error("%s", exc)
+        return 2
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: daemon.stop())
+    daemon.run()
+    return 0
+
+
+def _build_daemon(args: argparse.Namespace) -> Daemon:
+    return Daemon(
         udp_port=args.port,
         evidence_dir=args.evidence_dir,
         sample_dir=args.sample_dir,
         project_path=args.project,
         export_dir=args.export_dir,
         manifest_dir=args.manifest_dir,
+        session_id=args.session_id,
+        stem_id=args.stem_id,
+        source_category=args.source_category,
+        signing_key_path=args.signing_key,
+        portable_private_key_path=args.portable_private_key,
+        portable_public_key_path=args.portable_public_key,
+        provenance_store=args.provenance_store,
+        generate_html_report=not args.no_html_report,
+        open_artifacts=args.open_artifacts,
+        time_anchor_url=args.time_anchor,
+        ots_calendars=(args.ots_calendar or []) if (args.ots or args.ots_calendar) else None,
+        sdk_adapter_enabled=args.sdk_adapter,
+        sdk_cli=args.sdk_cli,
+        sdk_development_key=args.sdk_development_key,
+        sdk_registry=args.sdk_registry,
     )
-    daemon.run()
-    return 0
 
 
 if __name__ == "__main__":
